@@ -4,10 +4,60 @@ import config from '../config/config.js';
 import { generateToolCallId } from '../utils/idGenerator.js';
 import AntigravityRequester from '../AntigravityRequester.js';
 import { saveBase64Image } from '../utils/imageStorage.js';
+import logger from '../utils/logger.js';
+import { httpAgent, httpsAgent } from '../utils/utils.js';
+import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
 
 // 请求客户端：优先使用 AntigravityRequester，失败则降级到 axios
 let requester = null;
 let useAxios = false;
+
+// ==================== 模型列表缓存（智能管理） ====================
+// 缓存过期时间根据内存压力动态调整
+const getModelCacheTTL = () => {
+  const baseTTL = config.cache?.modelListTTL || 60 * 60 * 1000;
+  const pressure = memoryManager.currentPressure;
+  // 高压力时缩短缓存时间
+  if (pressure === MemoryPressure.CRITICAL) return Math.min(baseTTL, 5 * 60 * 1000);
+  if (pressure === MemoryPressure.HIGH) return Math.min(baseTTL, 15 * 60 * 1000);
+  return baseTTL;
+};
+
+let modelListCache = null;
+let modelListCacheTime = 0;
+
+// 默认模型列表（当 API 请求失败时使用）
+const DEFAULT_MODELS = [
+  'claude-opus-4-5',
+  'claude-opus-4-5-thinking',
+  'claude-sonnet-4-5-thinking',
+  'claude-sonnet-4-5',
+  'gemini-3-pro-high',
+  'gemini-2.5-flash-lite',
+  'gemini-3-pro-image',
+  'gemini-2.5-flash-thinking',
+  'gemini-2.5-pro',
+  'gemini-2.5-flash',
+  'gemini-3-pro-low',
+  'chat_20706',
+  'rev19-uic3-1p',
+  'gpt-oss-120b-medium',
+  'chat_23310'
+];
+
+// 生成默认模型列表响应
+function getDefaultModelList() {
+  const created = Math.floor(Date.now() / 1000);
+  return {
+    object: 'list',
+    data: DEFAULT_MODELS.map(id => ({
+      id,
+      object: 'model',
+      created,
+      owned_by: 'google'
+    }))
+  };
+}
 
 if (config.useNativeAxios === true) {
   useAxios = true;
@@ -19,6 +69,106 @@ if (config.useNativeAxios === true) {
     useAxios = true;
   }
 }
+
+// ==================== 零拷贝优化 ====================
+
+// 预编译的常量（避免重复创建字符串）
+const DATA_PREFIX = 'data: ';
+const DATA_PREFIX_LEN = DATA_PREFIX.length;
+
+// 高效的行分割器（零拷贝，避免 split 创建新数组）
+// 使用对象池复用 LineBuffer 实例
+class LineBuffer {
+  constructor() {
+    this.buffer = '';
+    this.lines = [];
+  }
+  
+  // 追加数据并返回完整的行
+  append(chunk) {
+    this.buffer += chunk;
+    this.lines.length = 0; // 重用数组
+    
+    let start = 0;
+    let end;
+    while ((end = this.buffer.indexOf('\n', start)) !== -1) {
+      this.lines.push(this.buffer.slice(start, end));
+      start = end + 1;
+    }
+    
+    // 保留未完成的部分
+    this.buffer = start < this.buffer.length ? this.buffer.slice(start) : '';
+    return this.lines;
+  }
+  
+  // 清空缓冲区（用于归还到池之前）
+  clear() {
+    this.buffer = '';
+    this.lines.length = 0;
+  }
+}
+
+// LineBuffer 对象池
+const lineBufferPool = [];
+const getLineBuffer = () => {
+  const buffer = lineBufferPool.pop();
+  if (buffer) {
+    buffer.clear();
+    return buffer;
+  }
+  return new LineBuffer();
+};
+const releaseLineBuffer = (buffer) => {
+  const maxSize = memoryManager.getPoolSizes().lineBuffer;
+  if (lineBufferPool.length < maxSize) {
+    buffer.clear();
+    lineBufferPool.push(buffer);
+  }
+};
+
+// 对象池：复用 toolCall 对象
+const toolCallPool = [];
+const getToolCallObject = () => toolCallPool.pop() || { id: '', type: 'function', function: { name: '', arguments: '' } };
+const releaseToolCallObject = (obj) => {
+  const maxSize = memoryManager.getPoolSizes().toolCall;
+  if (toolCallPool.length < maxSize) toolCallPool.push(obj);
+};
+
+// 注册内存清理回调
+function registerMemoryCleanup() {
+  memoryManager.registerCleanup((pressure) => {
+    const poolSizes = memoryManager.getPoolSizes();
+    
+    // 根据压力缩减对象池
+    while (toolCallPool.length > poolSizes.toolCall) {
+      toolCallPool.pop();
+    }
+    while (lineBufferPool.length > poolSizes.lineBuffer) {
+      lineBufferPool.pop();
+    }
+    
+    // 高压力或紧急时清理模型缓存
+    if (pressure === MemoryPressure.HIGH || pressure === MemoryPressure.CRITICAL) {
+      const ttl = getModelCacheTTL();
+      const now = Date.now();
+      if (modelListCache && (now - modelListCacheTime) > ttl) {
+        modelListCache = null;
+        modelListCacheTime = 0;
+        logger.info('已清理过期模型列表缓存');
+      }
+    }
+    
+    // 紧急时强制清理模型缓存
+    if (pressure === MemoryPressure.CRITICAL && modelListCache) {
+      modelListCache = null;
+      modelListCacheTime = 0;
+      logger.info('紧急清理模型列表缓存');
+    }
+  });
+}
+
+// 初始化时注册清理回调
+registerMemoryCleanup();
 
 // ==================== 辅助函数 ====================
 
@@ -38,6 +188,9 @@ function buildAxiosConfig(url, headers, body = null) {
     url,
     headers,
     timeout: config.timeout,
+    // 使用自定义 DNS 解析的 Agent（优先 IPv4，失败则 IPv6）
+    httpAgent,
+    httpsAgent,
     proxy: config.proxy ? (() => {
       const proxyUrl = new URL(config.proxy);
       return { protocol: proxyUrl.protocol.replace(':', ''), host: proxyUrl.hostname, port: parseInt(proxyUrl.port) };
@@ -86,19 +239,17 @@ async function handleApiError(error, token) {
   throw new Error(`API请求失败 (${status}): ${errorBody}`);
 }
 
-// 转换 functionCall 为 OpenAI 格式
+// 转换 functionCall 为 OpenAI 格式（使用对象池）
 function convertToToolCall(functionCall) {
-  return {
-    id: functionCall.id || generateToolCallId(),
-    type: 'function',
-    function: {
-      name: functionCall.name,
-      arguments: JSON.stringify(functionCall.args)
-    }
-  };
+  const toolCall = getToolCallObject();
+  toolCall.id = functionCall.id || generateToolCallId();
+  toolCall.function.name = functionCall.name;
+  toolCall.function.arguments = JSON.stringify(functionCall.args);
+  return toolCall;
 }
 
 // 解析并发送流式响应片段（会修改 state 并触发 callback）
+// 支持 DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
 function parseAndEmitStreamChunk(line, state, callback) {
   if (!line.startsWith('data: ')) return;
   
@@ -110,18 +261,10 @@ function parseAndEmitStreamChunk(line, state, callback) {
     if (parts) {
       for (const part of parts) {
         if (part.thought === true) {
-          // 思维链内容
-          if (!state.thinkingStarted) {
-            callback({ type: 'thinking', content: '<think>\n' });
-            state.thinkingStarted = true;
-          }
-          callback({ type: 'thinking', content: part.text || '' });
+          // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
+          callback({ type: 'reasoning', reasoning_content: part.text || '' });
         } else if (part.text !== undefined) {
           // 普通文本内容
-          if (state.thinkingStarted) {
-            callback({ type: 'thinking', content: '\n</think>\n' });
-            state.thinkingStarted = false;
-          }
           callback({ type: 'text', content: part.text });
         } else if (part.functionCall) {
           // 工具调用
@@ -132,10 +275,6 @@ function parseAndEmitStreamChunk(line, state, callback) {
     
     // 响应结束时发送工具调用和使用统计
     if (data.response?.candidates?.[0]?.finishReason) {
-      if (state.thinkingStarted) {
-        callback({ type: 'thinking', content: '\n</think>\n' });
-        state.thinkingStarted = false;
-      }
       if (state.toolCalls.length > 0) {
         callback({ type: 'tool_calls', tool_calls: state.toolCalls });
         state.toolCalls = [];
@@ -143,8 +282,8 @@ function parseAndEmitStreamChunk(line, state, callback) {
       // 提取 token 使用统计
       const usage = data.response?.usageMetadata;
       if (usage) {
-        callback({ 
-          type: 'usage', 
+        callback({
+          type: 'usage',
           usage: {
             prompt_tokens: usage.promptTokenCount || 0,
             completion_tokens: usage.candidatesTokenCount || 0,
@@ -163,31 +302,34 @@ function parseAndEmitStreamChunk(line, state, callback) {
 export async function generateAssistantResponse(requestBody, token, callback) {
   
   const headers = buildHeaders(token);
-  const state = { thinkingStarted: false, toolCalls: [] };
-  let buffer = ''; // 缓冲区：处理跨 chunk 的不完整行
+  const state = { toolCalls: [] };
+  const lineBuffer = getLineBuffer(); // 从对象池获取
   
   const processChunk = (chunk) => {
-    buffer += chunk;
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // 保留最后一行（可能不完整）
-    lines.forEach(line => parseAndEmitStreamChunk(line, state, callback));
+    const lines = lineBuffer.append(chunk);
+    for (let i = 0; i < lines.length; i++) {
+      parseAndEmitStreamChunk(lines[i], state, callback);
+    }
   };
   
-  if (useAxios) {
-    try {
+  try {
+    if (useAxios) {
       const axiosConfig = { ...buildAxiosConfig(config.api.url, headers, requestBody), responseType: 'stream' };
       const response = await axios(axiosConfig);
       
-      response.data.on('data', chunk => processChunk(chunk.toString()));
+      // 使用 Buffer 直接处理，避免 toString 的内存分配
+      response.data.on('data', chunk => {
+        processChunk(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      });
+      
       await new Promise((resolve, reject) => {
-        response.data.on('end', resolve);
+        response.data.on('end', () => {
+          releaseLineBuffer(lineBuffer); // 归还到对象池
+          resolve();
+        });
         response.data.on('error', reject);
       });
-    } catch (error) {
-      await handleApiError(error, token);
-    }
-  } else {
-    try {
+    } else {
       const streamResponse = requester.antigravity_fetchStream(config.api.url, buildRequesterConfig(headers, requestBody));
       let errorBody = '';
       let statusCode = null;
@@ -195,19 +337,45 @@ export async function generateAssistantResponse(requestBody, token, callback) {
       await new Promise((resolve, reject) => {
         streamResponse
           .onStart(({ status }) => { statusCode = status; })
-          .onData((chunk) => statusCode !== 200 ? errorBody += chunk : processChunk(chunk))
-          .onEnd(() => statusCode !== 200 ? reject({ status: statusCode, message: errorBody }) : resolve())
+          .onData((chunk) => {
+            if (statusCode !== 200) {
+              errorBody += chunk;
+            } else {
+              processChunk(chunk);
+            }
+          })
+          .onEnd(() => {
+            releaseLineBuffer(lineBuffer); // 归还到对象池
+            if (statusCode !== 200) {
+              reject({ status: statusCode, message: errorBody });
+            } else {
+              resolve();
+            }
+          })
           .onError(reject);
       });
-    } catch (error) {
-      await handleApiError(error, token);
     }
+  } catch (error) {
+    releaseLineBuffer(lineBuffer); // 确保归还
+    await handleApiError(error, token);
   }
 }
 
 export async function getAvailableModels() {
+  // 检查缓存是否有效（动态 TTL）
+  const now = Date.now();
+  const ttl = getModelCacheTTL();
+  if (modelListCache && (now - modelListCacheTime) < ttl) {
+    logger.info(`使用缓存的模型列表 (剩余有效期: ${Math.round((ttl - (now - modelListCacheTime)) / 1000)}秒)`);
+    return modelListCache;
+  }
+  
   const token = await tokenManager.getToken();
-  if (!token) throw new Error('没有可用的token，请运行 npm run login 获取token');
+  if (!token) {
+    // 没有 token 时返回默认模型列表
+    logger.warn('没有可用的 token，返回默认模型列表');
+    return getDefaultModelList();
+  }
   
   const headers = buildHeaders(token);
   
@@ -224,26 +392,56 @@ export async function getAvailableModels() {
       data = await response.json();
     }
     //console.log(JSON.stringify(data,null,2));
-    const modelList = Object.keys(data.models).map(id => ({
+    const created = Math.floor(Date.now() / 1000);
+    const modelList = Object.keys(data.models || {}).map(id => ({
         id,
         object: 'model',
-        created: Math.floor(Date.now() / 1000),
+        created,
         owned_by: 'google'
       }));
-    modelList.push({
-      id: "claude-opus-4-5",
-      object: 'model',
-      created: Math.floor(Date.now() / 1000),
-      owned_by: 'google'
-    })
     
-    return {
+    // 添加默认模型（如果 API 返回的列表中没有）
+    const existingIds = new Set(modelList.map(m => m.id));
+    for (const defaultModel of DEFAULT_MODELS) {
+      if (!existingIds.has(defaultModel)) {
+        modelList.push({
+          id: defaultModel,
+          object: 'model',
+          created,
+          owned_by: 'google'
+        });
+      }
+    }
+    
+    const result = {
       object: 'list',
       data: modelList
     };
+    
+    // 更新缓存
+    modelListCache = result;
+    modelListCacheTime = now;
+    const currentTTL = getModelCacheTTL();
+    logger.info(`模型列表已缓存 (有效期: ${currentTTL / 1000}秒, 模型数量: ${modelList.length})`);
+    
+    return result;
   } catch (error) {
-    await handleApiError(error, token);
+    // 如果请求失败但有缓存，返回过期的缓存
+    if (modelListCache) {
+      logger.warn(`获取模型列表失败，使用过期缓存: ${error.message}`);
+      return modelListCache;
+    }
+    // 没有缓存时返回默认模型列表
+    logger.warn(`获取模型列表失败，返回默认模型列表: ${error.message}`);
+    return getDefaultModelList();
   }
+}
+
+// 清除模型列表缓存（可用于手动刷新）
+export function clearModelListCache() {
+  modelListCache = null;
+  modelListCacheTime = 0;
+  logger.info('模型列表缓存已清除');
 }
 
 export async function getModelsWithQuotas(token) {
@@ -301,13 +499,14 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   // 解析响应内容
   const parts = data.response?.candidates?.[0]?.content?.parts || [];
   let content = '';
-  let thinkingContent = '';
+  let reasoningContent = '';
   const toolCalls = [];
   const imageUrls = [];
   
   for (const part of parts) {
     if (part.thought === true) {
-      thinkingContent += part.text || '';
+      // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
+      reasoningContent += part.text || '';
     } else if (part.text !== undefined) {
       content += part.text;
     } else if (part.functionCall) {
@@ -317,11 +516,6 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
       const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
       imageUrls.push(imageUrl);
     }
-  }
-  
-  // 拼接思维链标签
-  if (thinkingContent) {
-    content = `<think>\n${thinkingContent}\n</think>\n${content}`;
   }
   
   // 提取 token 使用统计
@@ -336,10 +530,10 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   if (imageUrls.length > 0) {
     let markdown = content ? content + '\n\n' : '';
     markdown += imageUrls.map(url => `![image](${url})`).join('\n\n');
-    return { content: markdown, toolCalls, usage: usageData };
+    return { content: markdown, reasoningContent: reasoningContent || null, toolCalls, usage: usageData };
   }
   
-  return { content, toolCalls, usage: usageData };
+  return { content, reasoningContent: reasoningContent || null, toolCalls, usage: usageData };
 }
 
 export async function generateImageForSD(requestBody, token) {
@@ -371,3 +565,6 @@ export async function generateImageForSD(requestBody, token) {
 export function closeRequester() {
   if (requester) requester.close();
 }
+
+// 导出内存清理注册函数（供外部调用）
+export { registerMemoryCleanup };

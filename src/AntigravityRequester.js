@@ -6,6 +6,9 @@ import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// 缓冲区大小警告阈值（不限制，只警告）
+const BUFFER_WARNING_SIZE = 50 * 1024 * 1024; // 50MB 警告
+
 class antigravityRequester {
     constructor(options = {}) {
         this.binPath = options.binPath;
@@ -15,6 +18,7 @@ class antigravityRequester {
         this.pendingRequests = new Map();
         this.buffer = '';
         this.writeQueue = Promise.resolve();
+        this.bufferWarned = false;
     }
 
     _getExecutablePath() {
@@ -64,15 +68,28 @@ class antigravityRequester {
         
         // 使用 setImmediate 异步处理数据,避免阻塞
         this.proc.stdout.on('data', (data) => {
-            this.buffer += data.toString();
+            const chunk = data.toString();
+            
+            // 缓冲区大小监控（仅警告，不限制，因为图片响应可能很大）
+            if (!this.bufferWarned && this.buffer.length > BUFFER_WARNING_SIZE) {
+                console.warn(`AntigravityRequester: 缓冲区较大 (${Math.round(this.buffer.length / 1024 / 1024)}MB)，可能有大型响应`);
+                this.bufferWarned = true;
+            }
+            
+            this.buffer += chunk;
             
             // 使用 setImmediate 异步处理,避免阻塞 stdout 读取
             setImmediate(() => {
-                const lines = this.buffer.split('\n');
-                this.buffer = lines.pop();
-
-                for (const line of lines) {
-                    if (!line.trim()) continue;
+                let start = 0;
+                let end;
+                
+                // 高效的行分割（避免 split 创建大量字符串）
+                while ((end = this.buffer.indexOf('\n', start)) !== -1) {
+                    const line = this.buffer.slice(start, end).trim();
+                    start = end + 1;
+                    
+                    if (!line) continue;
+                    
                     try {
                         const response = JSON.parse(line);
                         const pending = this.pendingRequests.get(response.id);
@@ -92,9 +109,13 @@ class antigravityRequester {
                             }
                         }
                     } catch (e) {
-                        console.error('Failed to parse response:', e, 'Line:', line);
+                        // 忽略 JSON 解析错误（可能是不完整的行）
                     }
                 }
+                
+                // 保留未处理的部分
+                this.buffer = start < this.buffer.length ? this.buffer.slice(start) : '';
+                this.bufferWarned = false;
             });
         });
 
@@ -168,9 +189,17 @@ class antigravityRequester {
                 if (canWrite) {
                     resolve();
                 } else {
-                    // 等待 drain 事件
-                    this.proc.stdin.once('drain', resolve);
-                    this.proc.stdin.once('error', reject);
+                    // 等待 drain 事件，并在任一事件触发后移除另一个监听器
+                    const onDrain = () => {
+                        this.proc.stdin.removeListener('error', onError);
+                        resolve();
+                    };
+                    const onError = (err) => {
+                        this.proc.stdin.removeListener('drain', onDrain);
+                        reject(err);
+                    };
+                    this.proc.stdin.once('drain', onDrain);
+                    this.proc.stdin.once('error', onError);
                 }
             });
         }).catch(err => {
@@ -180,8 +209,49 @@ class antigravityRequester {
 
     close() {
         if (this.proc) {
-            this.proc.stdin.end();
+            // 先拒绝所有待处理的请求
+            for (const [id, pending] of this.pendingRequests) {
+                if (pending.reject) {
+                    pending.reject(new Error('Requester closed'));
+                } else if (pending.streamResponse && pending.streamResponse._onError) {
+                    pending.streamResponse._onError(new Error('Requester closed'));
+                }
+            }
+            this.pendingRequests.clear();
+            
+            // 清理缓冲区
+            this.buffer = '';
+            
+            // 关闭输入流
+            try {
+                this.proc.stdin.end();
+            } catch (e) {
+                // 忽略关闭错误
+            }
+            
+            // 给子进程一点时间优雅退出，否则强制终止
+            const proc = this.proc;
             this.proc = null;
+            
+            setTimeout(() => {
+                try {
+                    if (proc && !proc.killed) {
+                        proc.kill('SIGTERM');
+                        // 如果 SIGTERM 无效，1秒后使用 SIGKILL
+                        setTimeout(() => {
+                            try {
+                                if (proc && !proc.killed) {
+                                    proc.kill('SIGKILL');
+                                }
+                            } catch (e) {
+                                // 忽略错误
+                            }
+                        }, 1000);
+                    }
+                } catch (e) {
+                    // 忽略错误
+                }
+            }, 500);
         }
     }
 }

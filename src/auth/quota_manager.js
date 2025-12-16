@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { log } from '../utils/logger.js';
+import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,9 +13,11 @@ class QuotaManager {
     this.cache = new Map();
     this.CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
     this.CLEANUP_INTERVAL = 60 * 60 * 1000; // 1小时清理一次
+    this.cleanupTimer = null;
     this.ensureFileExists();
     this.loadFromFile();
     this.startCleanupTimer();
+    this.registerMemoryCleanup();
   }
 
   ensureFileExists() {
@@ -93,7 +96,35 @@ class QuotaManager {
   }
 
   startCleanupTimer() {
-    setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+    this.cleanupTimer = setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+  }
+
+  stopCleanupTimer() {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
+
+  // 注册内存清理回调
+  registerMemoryCleanup() {
+    memoryManager.registerCleanup((pressure) => {
+      // 根据压力级别调整缓存 TTL
+      if (pressure === MemoryPressure.CRITICAL) {
+        // 紧急时清理所有缓存
+        const size = this.cache.size;
+        if (size > 0) {
+          this.cache.clear();
+          log.info(`紧急清理 ${size} 个额度缓存`);
+        }
+      } else if (pressure === MemoryPressure.HIGH) {
+        // 高压力时清理过期缓存
+        this.cleanup();
+      }
+    });
   }
 
   convertToBeijingTime(utcTimeStr) {

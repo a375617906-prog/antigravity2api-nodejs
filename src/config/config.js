@@ -27,10 +27,41 @@ if (fs.existsSync(configJsonPath)) {
 // 加载 .env
 dotenv.config();
 
+// 获取代理配置：优先使用 PROXY，其次使用系统代理环境变量
+function getProxyConfig() {
+  // 优先使用显式配置的 PROXY
+  if (process.env.PROXY) {
+    return process.env.PROXY;
+  }
+  
+  // 检查系统代理环境变量（按优先级）
+  const systemProxy = process.env.HTTPS_PROXY ||
+                      process.env.https_proxy ||
+                      process.env.HTTP_PROXY ||
+                      process.env.http_proxy ||
+                      process.env.ALL_PROXY ||
+                      process.env.all_proxy;
+  
+  if (systemProxy) {
+    log.info(`使用系统代理: ${systemProxy}`);
+  }
+  
+  return systemProxy || null;
+}
+
 const config = {
   server: {
     port: jsonConfig.server?.port || 8045,
-    host: jsonConfig.server?.host || '0.0.0.0'
+    host: jsonConfig.server?.host || '0.0.0.0',
+    heartbeatInterval: jsonConfig.server?.heartbeatInterval || 15000,  // 心跳间隔(ms)，防止CF超时
+    memoryThreshold: jsonConfig.server?.memoryThreshold || 500  // 内存阈值(MB)，超过触发GC
+  },
+  cache: {
+    modelListTTL: jsonConfig.cache?.modelListTTL || 60 * 60 * 1000  // 模型列表缓存时间(ms)，默认60分钟
+  },
+  rotation: {
+    strategy: jsonConfig.rotation?.strategy || 'round_robin',  // 轮询策略: round_robin, quota_exhausted, request_count
+    requestCount: jsonConfig.rotation?.requestCount || 10  // request_count策略下每个token的请求次数
   },
   imageBaseUrl: process.env.IMAGE_BASE_URL || null,
   maxImages: jsonConfig.other?.maxImages || 10,
@@ -45,7 +76,8 @@ const config = {
     temperature: jsonConfig.defaults?.temperature || 1,
     top_p: jsonConfig.defaults?.topP || 0.85,
     top_k: jsonConfig.defaults?.topK || 50,
-    max_tokens: jsonConfig.defaults?.maxTokens || 8096
+    max_tokens: jsonConfig.defaults?.maxTokens || 32000,
+    thinking_budget: jsonConfig.defaults?.thinkingBudget || 16000
   },
   security: {
     maxRequestSize: jsonConfig.server?.maxRequestSize || '50mb',
@@ -57,8 +89,8 @@ const config = {
     jwtSecret: process.env.JWT_SECRET || 'your-jwt-secret-key-change-this-in-production'
   },
   useNativeAxios: jsonConfig.other?.useNativeAxios !== false,
-  timeout: jsonConfig.other?.timeout || 180000,
-  proxy: process.env.PROXY || null,
+  timeout: jsonConfig.other?.timeout || 300000,
+  proxy: getProxyConfig(),
   systemInstruction: process.env.SYSTEM_INSTRUCTION || '',
   skipProjectIdFetch: jsonConfig.other?.skipProjectIdFetch === true
 };

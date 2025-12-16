@@ -129,21 +129,26 @@ router.post('/oauth/exchange', authMiddleware, async (req, res) => {
       logger.warn('获取用户邮箱失败:', err.message);
     }
     
-    if (config.skipProjectIdFetch) {
-      account.projectId = generateProjectId();
-      logger.info('使用随机生成的projectId: ' + account.projectId);
-    } else {
-      try {
-        const projectId = await tokenManager.fetchProjectId(account);
-        if (projectId === undefined) {
-          return res.status(400).json({ success: false, message: '该账号无资格使用（无法获取projectId）' });
-        }
+    // 始终尝试获取 projectId 进行资格校验
+    // 如果无资格，自动退回到无资格模式使用随机 projectId
+    try {
+      const projectId = await tokenManager.fetchProjectId(account);
+      if (projectId === undefined) {
+        // 无资格，自动退回到无资格模式
+        account.projectId = generateProjectId();
+        account.hasQuota = false;
+        logger.warn('该账号无资格使用，已自动退回无资格模式，使用随机projectId: ' + account.projectId);
+      } else {
         account.projectId = projectId;
+        account.hasQuota = true;
         logger.info('账号验证通过，projectId: ' + projectId);
-      } catch (error) {
-        logger.error('验证账号资格失败:', error.message);
-        return res.status(500).json({ success: false, message: '验证账号资格失败: ' + error.message });
       }
+    } catch (error) {
+      // 获取失败时也退回到无资格模式
+      logger.warn('验证账号资格失败: ' + error.message + '，已自动退回无资格模式');
+      account.projectId = generateProjectId();
+      account.hasQuota = false;
+      logger.info('使用随机生成的projectId: ' + account.projectId);
     }
     
     res.json({ success: true, data: account });
@@ -191,6 +196,49 @@ router.put('/config', authMiddleware, (req, res) => {
   }
 });
 
+// 获取轮询策略配置
+router.get('/rotation', authMiddleware, (req, res) => {
+  try {
+    const rotationConfig = tokenManager.getRotationConfig();
+    res.json({ success: true, data: rotationConfig });
+  } catch (error) {
+    logger.error('获取轮询配置失败:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 更新轮询策略配置
+router.put('/rotation', authMiddleware, (req, res) => {
+  try {
+    const { strategy, requestCount } = req.body;
+    
+    // 验证策略值
+    const validStrategies = ['round_robin', 'quota_exhausted', 'request_count'];
+    if (strategy && !validStrategies.includes(strategy)) {
+      return res.status(400).json({
+        success: false,
+        message: `无效的策略，可选值: ${validStrategies.join(', ')}`
+      });
+    }
+    
+    // 更新内存中的配置
+    tokenManager.updateRotationConfig(strategy, requestCount);
+    
+    // 同时保存到config.json
+    const currentConfig = getConfigJson();
+    if (!currentConfig.rotation) currentConfig.rotation = {};
+    if (strategy) currentConfig.rotation.strategy = strategy;
+    if (requestCount) currentConfig.rotation.requestCount = requestCount;
+    saveConfigJson(currentConfig);
+    
+    logger.info(`轮询策略已更新: ${strategy || '未变'}, 请求次数: ${requestCount || '未变'}`);
+    res.json({ success: true, message: '轮询策略已更新', data: tokenManager.getRotationConfig() });
+  } catch (error) {
+    logger.error('更新轮询配置失败:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // 获取指定Token的模型额度
 router.get('/tokens/:refreshToken/quotas', authMiddleware, async (req, res) => {
   try {
@@ -209,7 +257,8 @@ router.get('/tokens/:refreshToken/quotas', authMiddleware, async (req, res) => {
         tokenData = await tokenManager.refreshToken(tokenData);
       } catch (error) {
         logger.error('刷新token失败:', error.message);
-        return res.status(401).json({ success: false, message: 'Token已过期且刷新失败' });
+        // 使用 400 而不是 401，避免前端误认为 JWT 登录过期
+        return res.status(400).json({ success: false, message: 'Google Token已过期且刷新失败，请重新登录Google账号' });
       }
     }
     

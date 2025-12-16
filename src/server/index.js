@@ -9,11 +9,38 @@ import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import adminRouter from '../routes/admin.js';
 import sdRouter from '../routes/sd.js';
+import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
+// ==================== 心跳机制（防止 CF 超时） ====================
+const HEARTBEAT_INTERVAL = config.server.heartbeatInterval || 15000; // 从配置读取心跳间隔
+const SSE_HEARTBEAT = Buffer.from(': heartbeat\n\n');
+
+// 创建心跳定时器
+const createHeartbeat = (res) => {
+  const timer = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(SSE_HEARTBEAT);
+    } else {
+      clearInterval(timer);
+    }
+  }, HEARTBEAT_INTERVAL);
+  
+  // 响应结束时清理
+  res.on('close', () => clearInterval(timer));
+  res.on('finish', () => clearInterval(timer));
+  
+  return timer;
+};
+
+// 预编译的常量字符串（避免重复创建）
+const SSE_PREFIX = Buffer.from('data: ');
+const SSE_SUFFIX = Buffer.from('\n\n');
+const SSE_DONE = Buffer.from('data: [DONE]\n\n');
 
 // 工具函数：生成响应元数据
 const createResponseMeta = () => ({
@@ -26,25 +53,54 @@ const setStreamHeaders = (res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // 禁用 nginx 缓冲
 };
 
-// 工具函数：构建流式数据块
-const createStreamChunk = (id, created, model, delta, finish_reason = null) => ({
-  id,
-  object: 'chat.completion.chunk',
-  created,
-  model,
-  choices: [{ index: 0, delta, finish_reason }]
+// 工具函数：构建流式数据块（使用动态对象池减少 GC）
+// 支持 DeepSeek 格式的 reasoning_content
+const chunkPool = [];
+const getChunkObject = () => chunkPool.pop() || { choices: [{ index: 0, delta: {}, finish_reason: null }] };
+const releaseChunkObject = (obj) => {
+  const maxSize = memoryManager.getPoolSizes().chunk;
+  if (chunkPool.length < maxSize) chunkPool.push(obj);
+};
+
+// 注册内存清理回调
+memoryManager.registerCleanup((pressure) => {
+  const poolSizes = memoryManager.getPoolSizes();
+  // 根据压力缩减对象池
+  while (chunkPool.length > poolSizes.chunk) {
+    chunkPool.pop();
+  }
 });
 
-// 工具函数：写入流式数据
+// 启动内存管理器
+memoryManager.start(30000);
+
+const createStreamChunk = (id, created, model, delta, finish_reason = null) => {
+  const chunk = getChunkObject();
+  chunk.id = id;
+  chunk.object = 'chat.completion.chunk';
+  chunk.created = created;
+  chunk.model = model;
+  chunk.choices[0].delta = delta;
+  chunk.choices[0].finish_reason = finish_reason;
+  return chunk;
+};
+
+// 工具函数：零拷贝写入流式数据
 const writeStreamData = (res, data) => {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const json = JSON.stringify(data);
+  // 释放对象回池
+  if (data.choices) releaseChunkObject(data);
+  res.write(SSE_PREFIX);
+  res.write(json);
+  res.write(SSE_SUFFIX);
 };
 
 // 工具函数：结束流式响应
 const endStream = (res) => {
-  res.write('data: [DONE]\n\n');
+  res.write(SSE_DONE);
   res.end();
 };
 
@@ -102,6 +158,26 @@ app.get('/v1/models', async (req, res) => {
   }
 });
 
+// 内存监控端点
+app.get('/v1/memory', (req, res) => {
+  const usage = process.memoryUsage();
+  res.json({
+    heapUsed: usage.heapUsed,
+    heapTotal: usage.heapTotal,
+    rss: usage.rss,
+    external: usage.external,
+    arrayBuffers: usage.arrayBuffers,
+    pressure: memoryManager.getCurrentPressure(),
+    poolSizes: memoryManager.getPoolSizes(),
+    chunkPoolSize: chunkPool.length
+  });
+});
+
+// 健康检查端点
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
+
 
 
 app.post('/v1/chat/completions', async (req, res) => {
@@ -136,35 +212,54 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (stream) {
       setStreamHeaders(res);
       
-      if (isImageModel) {
-        //console.log(JSON.stringify(requestBody,null,2));
-        const { content, usage } = await generateAssistantResponseNoStream(requestBody, token);
-        writeStreamData(res, createStreamChunk(id, created, model, { content }));
-        writeStreamData(res, { ...createStreamChunk(id, created, model, {}, 'stop'), usage });
-        endStream(res);
-      } else {
-        let hasToolCall = false;
-        let usageData = null;
-        await generateAssistantResponse(requestBody, token, (data) => {
-          if (data.type === 'usage') {
-            usageData = data.usage;
-          } else {
-            const delta = data.type === 'tool_calls' 
-              ? { tool_calls: data.tool_calls } 
-              : { content: data.content };
-            if (data.type === 'tool_calls') hasToolCall = true;
-            writeStreamData(res, createStreamChunk(id, created, model, delta));
-          }
-        });
-        writeStreamData(res, { ...createStreamChunk(id, created, model, {}, hasToolCall ? 'tool_calls' : 'stop'), usage: usageData });
+      // 启动心跳，防止 Cloudflare 超时断连
+      const heartbeatTimer = createHeartbeat(res);
+      
+      try {
+        if (isImageModel) {
+          //console.log(JSON.stringify(requestBody,null,2));
+          const { content, usage } = await generateAssistantResponseNoStream(requestBody, token);
+          writeStreamData(res, createStreamChunk(id, created, model, { content }));
+          writeStreamData(res, { ...createStreamChunk(id, created, model, {}, 'stop'), usage });
+        } else {
+          let hasToolCall = false;
+          let usageData = null;
+          await generateAssistantResponse(requestBody, token, (data) => {
+            if (data.type === 'usage') {
+              usageData = data.usage;
+            } else if (data.type === 'reasoning') {
+              // DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
+              const delta = { reasoning_content: data.reasoning_content };
+              writeStreamData(res, createStreamChunk(id, created, model, delta));
+            } else if (data.type === 'tool_calls') {
+              hasToolCall = true;
+              const delta = { tool_calls: data.tool_calls };
+              writeStreamData(res, createStreamChunk(id, created, model, delta));
+            } else {
+              const delta = { content: data.content };
+              writeStreamData(res, createStreamChunk(id, created, model, delta));
+            }
+          });
+          writeStreamData(res, { ...createStreamChunk(id, created, model, {}, hasToolCall ? 'tool_calls' : 'stop'), usage: usageData });
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
         endStream(res);
       }
     } else {
-      const { content, toolCalls, usage } = await generateAssistantResponseNoStream(requestBody, token);
-      const message = { role: 'assistant', content };
+      // 非流式请求：设置较长超时，避免大模型响应超时
+      req.setTimeout(0); // 禁用请求超时
+      res.setTimeout(0); // 禁用响应超时
+      
+      const { content, reasoningContent, toolCalls, usage } = await generateAssistantResponseNoStream(requestBody, token);
+      // DeepSeek 格式：reasoning_content 在 content 之前
+      const message = { role: 'assistant' };
+      if (reasoningContent) message.reasoning_content = reasoningContent;
+      message.content = content;
       if (toolCalls.length > 0) message.tool_calls = toolCalls;
       
-      res.json({
+      // 使用预构建的响应对象，减少内存分配
+      const response = {
         id,
         object: 'chat.completion',
         created,
@@ -175,7 +270,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
         }],
         usage
-      });
+      };
+      
+      res.json(response);
     }
   } catch (error) {
     logger.error('生成响应失败:', error.message);
@@ -224,13 +321,40 @@ server.on('error', (error) => {
 
 const shutdown = () => {
   logger.info('正在关闭服务器...');
+  
+  // 停止内存管理器
+  memoryManager.stop();
+  logger.info('已停止内存管理器');
+  
+  // 关闭子进程请求器
   closeRequester();
+  logger.info('已关闭子进程请求器');
+  
+  // 清理对象池
+  chunkPool.length = 0;
+  logger.info('已清理对象池');
+  
   server.close(() => {
     logger.info('服务器已关闭');
     process.exit(0);
   });
-  setTimeout(() => process.exit(0), 5000);
+  
+  // 5秒超时强制退出
+  setTimeout(() => {
+    logger.warn('服务器关闭超时，强制退出');
+    process.exit(0);
+  }, 5000);
 };
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// 未捕获异常处理
+process.on('uncaughtException', (error) => {
+  logger.error('未捕获异常:', error.message);
+  // 不立即退出，让当前请求完成
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('未处理的 Promise 拒绝:', reason);
+});

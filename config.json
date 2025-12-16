@@ -2,7 +2,13 @@
   "server": {
     "port": 8045,
     "host": "0.0.0.0",
-    "maxRequestSize": "500mb"
+    "maxRequestSize": "500mb",
+    "heartbeatInterval": 15000,
+    "memoryThreshold": 25
+  },
+  "rotation": {
+    "strategy": "round_robin",
+    "requestCount": 50
   },
   "api": {
     "url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse",
@@ -13,12 +19,16 @@
   },
   "defaults": {
     "temperature": 1,
-    "topP": 0.85,
+    "topP": 1,
     "topK": 50,
-    "maxTokens": 8096
+    "maxTokens": 32000,
+    "thinkingBudget": 16000
+  },
+  "cache": {
+    "modelListTTL": 3600000
   },
   "other": {
-    "timeout": 180000,
+    "timeout": 300000,
     "skipProjectIdFetch": false,
     "useNativeAxios": false
   }

@@ -4,17 +4,30 @@ import { fileURLToPath } from 'url';
 import axios from 'axios';
 import { log } from '../utils/logger.js';
 import { generateSessionId, generateProjectId } from '../utils/idGenerator.js';
-import config from '../config/config.js';
+import config, { getConfigJson } from '../config/config.js';
 import { OAUTH_CONFIG } from '../constants/oauth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// 轮询策略枚举
+const RotationStrategy = {
+  ROUND_ROBIN: 'round_robin',           // 均衡负载：每次请求切换
+  QUOTA_EXHAUSTED: 'quota_exhausted',   // 额度耗尽才切换
+  REQUEST_COUNT: 'request_count'        // 自定义次数后切换
+};
 
 class TokenManager {
   constructor(filePath = path.join(__dirname,'..','..','data' ,'accounts.json')) {
     this.filePath = filePath;
     this.tokens = [];
     this.currentIndex = 0;
+    
+    // 轮询策略相关 - 使用原子操作避免锁
+    this.rotationStrategy = RotationStrategy.ROUND_ROBIN;
+    this.requestCountPerToken = 50;  // request_count 策略下每个token请求次数后切换
+    this.tokenRequestCounts = new Map();  // 记录每个token的请求次数
+    
     this.ensureFileExists();
     this.initialize();
   }
@@ -42,16 +55,56 @@ class TokenManager {
       }));
       
       this.currentIndex = 0;
+      this.tokenRequestCounts.clear();
+      
+      // 加载轮询策略配置
+      this.loadRotationConfig();
+      
       if (this.tokens.length === 0) {
         log.warn('⚠ 暂无可用账号，请使用以下方式添加：');
         log.warn('  方式1: 运行 npm run login 命令登录');
         log.warn('  方式2: 访问前端管理页面添加账号');
       } else {
         log.info(`成功加载 ${this.tokens.length} 个可用token`);
+        if (this.rotationStrategy === RotationStrategy.REQUEST_COUNT) {
+          log.info(`轮询策略: ${this.rotationStrategy}, 每token请求 ${this.requestCountPerToken} 次后切换`);
+        } else {
+          log.info(`轮询策略: ${this.rotationStrategy}`);
+        }
       }
     } catch (error) {
       log.error('初始化token失败:', error.message);
       this.tokens = [];
+    }
+  }
+
+  // 加载轮询策略配置
+  loadRotationConfig() {
+    try {
+      const jsonConfig = getConfigJson();
+      if (jsonConfig.rotation) {
+        this.rotationStrategy = jsonConfig.rotation.strategy || RotationStrategy.ROUND_ROBIN;
+        this.requestCountPerToken = jsonConfig.rotation.requestCount || 10;
+      }
+    } catch (error) {
+      log.warn('加载轮询配置失败，使用默认值:', error.message);
+    }
+  }
+
+  // 更新轮询策略（热更新）
+  updateRotationConfig(strategy, requestCount) {
+    if (strategy && Object.values(RotationStrategy).includes(strategy)) {
+      this.rotationStrategy = strategy;
+    }
+    if (requestCount && requestCount > 0) {
+      this.requestCountPerToken = requestCount;
+    }
+    // 重置计数器
+    this.tokenRequestCounts.clear();
+    if (this.rotationStrategy === RotationStrategy.REQUEST_COUNT) {
+      log.info(`轮询策略已更新: ${this.rotationStrategy}, 每token请求 ${this.requestCountPerToken} 次后切换`);
+    } else {
+      log.info(`轮询策略已更新: ${this.rotationStrategy}`);
     }
   }
 
@@ -156,14 +209,79 @@ class TokenManager {
     this.currentIndex = this.currentIndex % Math.max(this.tokens.length, 1);
   }
 
+  // 原子操作：获取并递增请求计数
+  incrementRequestCount(tokenKey) {
+    const current = this.tokenRequestCounts.get(tokenKey) || 0;
+    const newCount = current + 1;
+    this.tokenRequestCounts.set(tokenKey, newCount);
+    return newCount;
+  }
+
+  // 原子操作：重置请求计数
+  resetRequestCount(tokenKey) {
+    this.tokenRequestCounts.set(tokenKey, 0);
+  }
+
+  // 判断是否应该切换到下一个token
+  shouldRotate(token) {
+    switch (this.rotationStrategy) {
+      case RotationStrategy.ROUND_ROBIN:
+        // 均衡负载：每次请求后都切换
+        return true;
+        
+      case RotationStrategy.QUOTA_EXHAUSTED:
+        // 额度耗尽才切换：检查token的hasQuota标记
+        // 如果hasQuota为false，说明额度已耗尽，需要切换
+        return token.hasQuota === false;
+        
+      case RotationStrategy.REQUEST_COUNT:
+        // 自定义次数后切换
+        const tokenKey = token.refresh_token;
+        const count = this.incrementRequestCount(tokenKey);
+        if (count >= this.requestCountPerToken) {
+          this.resetRequestCount(tokenKey);
+          return true;
+        }
+        return false;
+        
+      default:
+        return true;
+    }
+  }
+
+  // 标记token额度耗尽
+  markQuotaExhausted(token) {
+    token.hasQuota = false;
+    this.saveToFile(token);
+    log.warn(`...${token.access_token.slice(-8)}: 额度已耗尽，标记为无额度`);
+    
+    // 如果是额度耗尽策略，立即切换到下一个token
+    if (this.rotationStrategy === RotationStrategy.QUOTA_EXHAUSTED) {
+      this.currentIndex = (this.currentIndex + 1) % Math.max(this.tokens.length, 1);
+    }
+  }
+
+  // 恢复token额度（用于额度重置后）
+  restoreQuota(token) {
+    token.hasQuota = true;
+    this.saveToFile(token);
+    log.info(`...${token.access_token.slice(-8)}: 额度已恢复`);
+  }
+
   async getToken() {
     if (this.tokens.length === 0) return null;
 
-    //const startIndex = this.currentIndex;
     const totalTokens = this.tokens.length;
+    const startIndex = this.currentIndex;
 
     for (let i = 0; i < totalTokens; i++) {
-      const token = this.tokens[this.currentIndex];
+      const index = (startIndex + i) % totalTokens;
+      const token = this.tokens[index];
+      
+      // 额度耗尽策略：跳过无额度的token
+      if (this.rotationStrategy === RotationStrategy.QUOTA_EXHAUSTED && token.hasQuota === false) {
+        continue;
+      }
       
       try {
         if (this.isExpired(token)) {
@@ -187,12 +305,19 @@ class TokenManager {
               this.saveToFile(token);
             } catch (error) {
               log.error(`...${token.access_token.slice(-8)}: 获取projectId失败:`, error.message);
-              this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
               continue;
             }
           }
         }
-        this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
+        
+        // 更新当前索引
+        this.currentIndex = index;
+        
+        // 根据策略决定是否切换
+        if (this.shouldRotate(token)) {
+          this.currentIndex = (this.currentIndex + 1) % totalTokens;
+        }
+        
         return token;
       } catch (error) {
         if (error.statusCode === 403 || error.statusCode === 400) {
@@ -201,9 +326,19 @@ class TokenManager {
           if (this.tokens.length === 0) return null;
         } else {
           log.error(`...${token.access_token.slice(-8)} 刷新失败:`, error.message);
-          this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
         }
       }
+    }
+
+    // 如果所有token都无额度，重置所有token的额度状态并重试
+    if (this.rotationStrategy === RotationStrategy.QUOTA_EXHAUSTED) {
+      log.warn('所有token额度已耗尽，重置额度状态');
+      this.tokens.forEach(t => {
+        t.hasQuota = true;
+      });
+      this.saveToFile();
+      // 返回第一个可用token
+      return this.tokens[0] || null;
     }
 
     return null;
@@ -241,6 +376,9 @@ class TokenManager {
       }
       if (tokenData.email) {
         newToken.email = tokenData.email;
+      }
+      if (tokenData.hasQuota !== undefined) {
+        newToken.hasQuota = tokenData.hasQuota;
       }
       
       allTokens.push(newToken);
@@ -311,13 +449,28 @@ class TokenManager {
         timestamp: token.timestamp,
         enable: token.enable !== false,
         projectId: token.projectId || null,
-        email: token.email || null
+        email: token.email || null,
+        hasQuota: token.hasQuota !== false
       }));
     } catch (error) {
       log.error('获取Token列表失败:', error.message);
       return [];
     }
   }
+
+  // 获取当前轮询配置
+  getRotationConfig() {
+    return {
+      strategy: this.rotationStrategy,
+      requestCount: this.requestCountPerToken,
+      currentIndex: this.currentIndex,
+      tokenCounts: Object.fromEntries(this.tokenRequestCounts)
+    };
+  }
 }
+
+// 导出策略枚举
+export { RotationStrategy };
+
 const tokenManager = new TokenManager();
 export default tokenManager;

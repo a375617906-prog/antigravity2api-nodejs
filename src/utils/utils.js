@@ -2,6 +2,43 @@ import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import { generateRequestId } from './idGenerator.js';
 import os from 'os';
+import dns from 'dns';
+import http from 'http';
+import https from 'https';
+import logger from './logger.js';
+
+// ==================== DNS 解析优化 ====================
+// 自定义 DNS 解析：优先 IPv4，失败则回退 IPv6
+function customLookup(hostname, options, callback) {
+  // 先尝试 IPv4
+  dns.lookup(hostname, { ...options, family: 4 }, (err4, address4, family4) => {
+    if (!err4 && address4) {
+      // IPv4 成功
+      return callback(null, address4, family4);
+    }
+    // IPv4 失败，尝试 IPv6
+    dns.lookup(hostname, { ...options, family: 6 }, (err6, address6, family6) => {
+      if (!err6 && address6) {
+        // IPv6 成功
+        logger.debug(`DNS: ${hostname} IPv4 失败，使用 IPv6: ${address6}`);
+        return callback(null, address6, family6);
+      }
+      // 都失败，返回 IPv4 的错误
+      callback(err4 || err6);
+    });
+  });
+}
+
+// 创建使用自定义 DNS 解析的 HTTP/HTTPS Agent
+const httpAgent = new http.Agent({
+  lookup: customLookup,
+  keepAlive: true
+});
+
+const httpsAgent = new https.Agent({
+  lookup: customLookup,
+  keepAlive: true
+});
 
 function extractImagesFromContent(content) {
   const result = { text: '', images: [] };
@@ -118,7 +155,11 @@ function handleToolCall(message, antigravityMessages){
 function openaiMessageToAntigravity(openaiMessages){
   const antigravityMessages = [];
   for (const message of openaiMessages) {
-    if (message.role === "user" || message.role === "system") {
+    if (message.role === "user") {
+      const extracted = extractImagesFromContent(message.content);
+      handleUserMessage(extracted, antigravityMessages);
+    } else if (message.role === "system") {
+      // 中间的 system 消息作为 user 处理（开头的 system 已在 generateRequestBody 中过滤）
       const extracted = extractImagesFromContent(message.content);
       handleUserMessage(extracted, antigravityMessages);
     } else if (message.role === "assistant") {
@@ -130,7 +171,72 @@ function openaiMessageToAntigravity(openaiMessages){
   
   return antigravityMessages;
 }
+
+/**
+ * 从 OpenAI 消息中提取并合并 system 指令
+ * 规则：
+ * 1. SYSTEM_INSTRUCTION 作为基础 system，可为空
+ * 2. 保留用户首条 system 信息，合并在基础 system 后面
+ * 3. 如果连续多条 system，合并成一条 system
+ * 4. 避免把真正的 system 重复作为 user 发送
+ */
+function extractSystemInstruction(openaiMessages) {
+  const baseSystem = config.systemInstruction || '';
+  
+  // 收集开头连续的 system 消息
+  const systemTexts = [];
+  for (const message of openaiMessages) {
+    if (message.role === 'system') {
+      const content = typeof message.content === 'string'
+        ? message.content
+        : (Array.isArray(message.content)
+            ? message.content.filter(item => item.type === 'text').map(item => item.text).join('')
+            : '');
+      if (content.trim()) {
+        systemTexts.push(content.trim());
+      }
+    } else {
+      // 遇到非 system 消息就停止收集
+      break;
+    }
+  }
+  
+  // 合并：基础 system + 用户的 system 消息
+  const parts = [];
+  if (baseSystem.trim()) {
+    parts.push(baseSystem.trim());
+  }
+  if (systemTexts.length > 0) {
+    parts.push(systemTexts.join('\n\n'));
+  }
+  
+  return parts.join('\n\n');
+}
+// reasoning_effort 到 thinkingBudget 的映射
+const REASONING_EFFORT_MAP = {
+  'low': 1024,
+  'medium': 16000,
+  'high': 32000
+};
+
 function generateGenerationConfig(parameters, enableThinking, actualModelName){
+  // 获取思考预算：
+  // 1. 优先使用 thinking_budget（直接数值）
+  // 2. 其次使用 reasoning_effort（OpenAI 格式：low/medium/high）
+  // 3. 最后使用配置默认值或硬编码默认值
+  const defaultThinkingBudget = config.defaults.thinking_budget ?? 16000;
+  
+  let thinkingBudget = 0;
+  if (enableThinking) {
+    if (parameters.thinking_budget !== undefined) {
+      thinkingBudget = parameters.thinking_budget;
+    } else if (parameters.reasoning_effort !== undefined) {
+      thinkingBudget = REASONING_EFFORT_MAP[parameters.reasoning_effort] ?? defaultThinkingBudget;
+    } else {
+      thinkingBudget = defaultThinkingBudget;
+    }
+  }
+  
   const generationConfig = {
     topP: parameters.top_p ?? config.defaults.top_p,
     topK: parameters.top_k ?? config.defaults.top_k,
@@ -146,7 +252,7 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName){
     ],
     thinkingConfig: {
       includeThoughts: enableThinking,
-      thinkingBudget: enableThinking ? 1024 : 0
+      thinkingBudget: thinkingBudget
     }
   }
   if (enableThinking && actualModelName.includes("claude")){
@@ -208,15 +314,25 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,tok
   const enableThinking = isEnableThinking(modelName);
   const actualModelName = modelMapping(modelName);
   
-  return{
+  // 提取合并后的 system 指令
+  const mergedSystemInstruction = extractSystemInstruction(openaiMessages);
+  
+  // 过滤掉开头连续的 system 消息，避免重复作为 user 发送
+  let startIndex = 0;
+  for (let i = 0; i < openaiMessages.length; i++) {
+    if (openaiMessages[i].role === 'system') {
+      startIndex = i + 1;
+    } else {
+      break;
+    }
+  }
+  const filteredMessages = openaiMessages.slice(startIndex);
+  
+  const requestBody = {
     project: token.projectId,
     requestId: generateRequestId(),
     request: {
-      contents: openaiMessageToAntigravity(openaiMessages),
-      systemInstruction: {
-        role: "user",
-        parts: [{ text: config.systemInstruction }]
-      },
+      contents: openaiMessageToAntigravity(filteredMessages),
       tools: convertOpenAIToolsToAntigravity(openaiTools),
       toolConfig: {
         functionCallingConfig: {
@@ -228,7 +344,17 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,tok
     },
     model: actualModelName,
     userAgent: "antigravity"
+  };
+  
+  // 只有当有 system 指令时才添加 systemInstruction 字段
+  if (mergedSystemInstruction) {
+    requestBody.request.systemInstruction = {
+      role: "user",
+      parts: [{ text: mergedSystemInstruction }]
+    };
   }
+  
+  return requestBody;
 }
 function getDefaultIp(){
   const interfaces = os.networkInterfaces();
@@ -250,5 +376,7 @@ function getDefaultIp(){
 export{
   generateRequestId,
   generateRequestBody,
-  getDefaultIp
+  getDefaultIp,
+  httpAgent,
+  httpsAgent
 }
