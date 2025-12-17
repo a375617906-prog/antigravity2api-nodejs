@@ -2,43 +2,6 @@ import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import { generateRequestId } from './idGenerator.js';
 import os from 'os';
-import dns from 'dns';
-import http from 'http';
-import https from 'https';
-import logger from './logger.js';
-
-// ==================== DNS 解析优化 ====================
-// 自定义 DNS 解析：优先 IPv4，失败则回退 IPv6
-function customLookup(hostname, options, callback) {
-  // 先尝试 IPv4
-  dns.lookup(hostname, { ...options, family: 4 }, (err4, address4, family4) => {
-    if (!err4 && address4) {
-      // IPv4 成功
-      return callback(null, address4, family4);
-    }
-    // IPv4 失败，尝试 IPv6
-    dns.lookup(hostname, { ...options, family: 6 }, (err6, address6, family6) => {
-      if (!err6 && address6) {
-        // IPv6 成功
-        logger.debug(`DNS: ${hostname} IPv4 失败，使用 IPv6: ${address6}`);
-        return callback(null, address6, family6);
-      }
-      // 都失败，返回 IPv4 的错误
-      callback(err4 || err6);
-    });
-  });
-}
-
-// 创建使用自定义 DNS 解析的 HTTP/HTTPS Agent
-const httpAgent = new http.Agent({
-  lookup: customLookup,
-  keepAlive: true
-});
-
-const httpsAgent = new https.Agent({
-  lookup: customLookup,
-  keepAlive: true
-});
 
 function extractImagesFromContent(content) {
   const result = { text: '', images: [] };
@@ -224,7 +187,7 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName){
   // 1. 优先使用 thinking_budget（直接数值）
   // 2. 其次使用 reasoning_effort（OpenAI 格式：low/medium/high）
   // 3. 最后使用配置默认值或硬编码默认值
-  const defaultThinkingBudget = config.defaults.thinking_budget ?? 16000;
+  const defaultThinkingBudget = config.defaults.thinking_budget ?? 1024;
   
   let thinkingBudget = 0;
   if (enableThinking) {
@@ -260,7 +223,30 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName){
   }
   return generationConfig
 }
-const EXCLUDED_KEYS = new Set(['$schema', 'additionalProperties', 'minLength', 'maxLength', 'minItems', 'maxItems', 'uniqueItems']);
+// 不被 Google 工具参数 Schema 支持的字段，在这里统一过滤掉
+// 包括：
+// - JSON Schema 的元信息字段：$schema, additionalProperties
+// - 长度/数量约束：minLength, maxLength, minItems, maxItems, uniqueItems（不必传给后端）
+// - 严格上下界 / 常量：exclusiveMaximum, exclusiveMinimum, const（Google Schema 不支持）
+// - 组合约束：anyOf/oneOf/allOf 以及其非标准写法 any_of/one_of/all_of（为避免上游实现差异，这里一律去掉）
+const EXCLUDED_KEYS = new Set([
+  '$schema',
+  'additionalProperties',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+  'uniqueItems',
+  'exclusiveMaximum',
+  'exclusiveMinimum',
+  'const',
+  'anyOf',
+  'oneOf',
+  'allOf',
+  'any_of',
+  'one_of',
+  'all_of'
+]);
 
 function cleanParameters(obj) {
   if (!obj || typeof obj !== 'object') return obj;
@@ -269,7 +255,8 @@ function cleanParameters(obj) {
   
   for (const [key, value] of Object.entries(obj)) {
     if (EXCLUDED_KEYS.has(key)) continue;
-    cleaned[key] = (value && typeof value === 'object') ? cleanParameters(value) : value;
+    const cleanedValue = (value && typeof value === 'object') ? cleanParameters(value) : value;
+    cleaned[key] = cleanedValue;
   }
   
   return cleaned;
@@ -278,12 +265,26 @@ function cleanParameters(obj) {
 function convertOpenAIToolsToAntigravity(openaiTools){
   if (!openaiTools || openaiTools.length === 0) return [];
   return openaiTools.map((tool)=>{
+    // 先清洗一遍参数，过滤/规范化不兼容字段
+    const rawParams = tool.function?.parameters || {};
+    const cleanedParams = cleanParameters(rawParams) || {};
+
+    // 确保顶层是一个合法的 JSON Schema 对象
+    // 如果用户没显式指定 type，则默认按 OpenAI 习惯设为 object
+    if (cleanedParams.type === undefined) {
+      cleanedParams.type = 'object';
+    }
+    // 对于 object 类型，至少保证有 properties 字段
+    if (cleanedParams.type === 'object' && cleanedParams.properties === undefined) {
+      cleanedParams.properties = {};
+    }
+
     return {
       functionDeclarations: [
         {
           name: tool.function.name,
           description: tool.function.description,
-          parameters: cleanParameters(tool.function.parameters)
+          parameters: cleanedParams
         }
       ]
     }
@@ -302,11 +303,12 @@ function modelMapping(modelName){
 }
 
 function isEnableThinking(modelName){
-  return modelName.endsWith('-thinking') ||
+  // 只要模型名里包含 -thinking（例如 gemini-2.0-flash-thinking-exp），就认为支持思考配置
+  return modelName.includes('-thinking') ||
     modelName === 'gemini-2.5-pro' ||
     modelName.startsWith('gemini-3-pro-') ||
     modelName === "rev19-uic3-1p" ||
-    modelName === "gpt-oss-120b-medium"
+    modelName === "gpt-oss-120b-medium";
 }
 
 function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,token){
@@ -356,17 +358,29 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,tok
   
   return requestBody;
 }
+/**
+ * 将通用文本对话请求体转换为图片生成请求体
+ * 统一配置 image_gen 所需字段，避免在各处手动删除/覆盖字段
+ */
+function prepareImageRequest(requestBody) {
+  if (!requestBody || !requestBody.request) return requestBody;
+
+  requestBody.request.generationConfig = { candidateCount: 1 };
+  requestBody.requestType = 'image_gen';
+
+  // image_gen 模式下不需要这些字段
+  delete requestBody.request.systemInstruction;
+  delete requestBody.request.tools;
+  delete requestBody.request.toolConfig;
+
+  return requestBody;
+}
+
 function getDefaultIp(){
   const interfaces = os.networkInterfaces();
-  if (interfaces.WLAN){
-    for (const inter of interfaces.WLAN){
+  for (const iface of Object.values(interfaces)){
+    for (const inter of iface){
       if (inter.family === 'IPv4' && !inter.internal){
-          return inter.address;
-      }
-    }
-  } else if (interfaces.wlan2) {
-    for (const inter of interfaces.wlan2) {
-      if (inter.family === 'IPv4' && !inter.internal) {
         return inter.address;
       }
     }
@@ -376,7 +390,6 @@ function getDefaultIp(){
 export{
   generateRequestId,
   generateRequestBody,
-  getDefaultIp,
-  httpAgent,
-  httpsAgent
+  prepareImageRequest,
+  getDefaultIp
 }

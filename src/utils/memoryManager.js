@@ -265,4 +265,14 @@ class MemoryManager {
 // 单例导出
 const memoryManager = new MemoryManager();
 export default memoryManager;
+
+// 统一封装注册清理回调，方便在各模块中保持一致风格
+export function registerMemoryPoolCleanup(pool, getMaxSize) {
+  memoryManager.registerCleanup(() => {
+    const maxSize = getMaxSize();
+    while (pool.length > maxSize) {
+      pool.pop();
+    }
+  });
+}
 export { MemoryPressure, THRESHOLDS };

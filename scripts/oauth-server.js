@@ -4,75 +4,57 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import log from '../src/utils/logger.js';
 import axios from 'axios';
+import log from '../src/utils/logger.js';
 import config from '../src/config/config.js';
 import { generateProjectId } from '../src/utils/idGenerator.js';
+import tokenManager from '../src/auth/token_manager.js';
+import { OAUTH_CONFIG, OAUTH_SCOPES } from '../src/constants/oauth.js';
+import { buildAxiosRequestConfig } from '../src/utils/httpClient.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+// 账号文件路径保持不变，仅用于日志展示，具体读写交给 TokenManager 处理
 const ACCOUNTS_FILE = path.join(__dirname, '..', 'data', 'accounts.json');
-
-const CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
-const CLIENT_SECRET = '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';
 const STATE = crypto.randomUUID();
 
-const SCOPES = [
-  'https://www.googleapis.com/auth/cloud-platform',
-  'https://www.googleapis.com/auth/userinfo.email',
-  'https://www.googleapis.com/auth/userinfo.profile',
-  'https://www.googleapis.com/auth/cclog',
-  'https://www.googleapis.com/auth/experimentsandconfigs'
-];
+const SCOPES = OAUTH_SCOPES;
 
 function generateAuthUrl(port) {
   const params = new URLSearchParams({
     access_type: 'offline',
-    client_id: CLIENT_ID,
+    client_id: OAUTH_CONFIG.CLIENT_ID,
     prompt: 'consent',
     redirect_uri: `http://localhost:${port}/oauth-callback`,
     response_type: 'code',
     scope: SCOPES.join(' '),
     state: STATE
   });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-}
-
-function getAxiosConfig() {
-  const axiosConfig = { timeout: config.timeout };
-  if (config.proxy) {
-    const proxyUrl = new URL(config.proxy);
-    axiosConfig.proxy = {
-      protocol: proxyUrl.protocol.replace(':', ''),
-      host: proxyUrl.hostname,
-      port: parseInt(proxyUrl.port)
-    };
-  }
-  return axiosConfig;
+  return `${OAUTH_CONFIG.AUTH_URL}?${params.toString()}`;
 }
 
 async function exchangeCodeForToken(code, port) {
   const postData = new URLSearchParams({
     code,
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
+    client_id: OAUTH_CONFIG.CLIENT_ID,
+    client_secret: OAUTH_CONFIG.CLIENT_SECRET,
     redirect_uri: `http://localhost:${port}/oauth-callback`,
     grant_type: 'authorization_code'
   });
   
-  const response = await axios({
+  const response = await axios(buildAxiosRequestConfig({
     method: 'POST',
-    url: 'https://oauth2.googleapis.com/token',
+    url: OAUTH_CONFIG.TOKEN_URL,
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     data: postData.toString(),
-    ...getAxiosConfig()
-  });
+    timeout: config.timeout
+  }));
   
   return response.data;
 }
 
 async function fetchUserEmail(accessToken) {
-  const response = await axios({
+  const response = await axios(buildAxiosRequestConfig({
     method: 'GET',
     url: 'https://www.googleapis.com/oauth2/v2/userinfo',
     headers: {
@@ -81,26 +63,9 @@ async function fetchUserEmail(accessToken) {
       'Authorization': `Bearer ${accessToken}`,
       'Accept-Encoding': 'gzip'
     },
-    ...getAxiosConfig()
-  });
+    timeout: config.timeout
+  }));
   return response.data?.email;
-}
-
-async function fetchProjectId(accessToken) {
-  const response = await axios({
-    method: 'POST',
-    url: 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist',
-    headers: {
-      'Host': 'daily-cloudcode-pa.sandbox.googleapis.com',
-      'User-Agent': 'antigravity/1.11.9 windows/amd64',
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'Accept-Encoding': 'gzip'
-    },
-    data: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
-    ...getAxiosConfig()
-  });
-  return response.data?.cloudaicompanionProject;
 }
 
 const server = http.createServer((req, res) => {
@@ -138,7 +103,7 @@ const server = http.createServer((req, res) => {
         } else {
           log.info('正在验证账号资格...');
           try {
-            const projectId = await fetchProjectId(account.access_token);
+            const projectId = await tokenManager.fetchProjectId({ access_token: account.access_token });
             if (projectId === undefined) {
               log.warn('该账号无资格使用（无法获取projectId），已跳过保存');
               res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -158,25 +123,12 @@ const server = http.createServer((req, res) => {
           }
         }
         
-        let accounts = [];
-        try {
-          if (fs.existsSync(ACCOUNTS_FILE)) {
-            accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
-          }
-        } catch (err) {
-          log.warn('读取 accounts.json 失败，将创建新文件');
+        const result = tokenManager.addToken(account);
+        if (result.success) {
+          log.info(`Token 已保存到 ${ACCOUNTS_FILE}`);
+        } else {
+          log.error('保存 Token 失败:', result.message);
         }
-        
-        accounts.push(account);
-        
-        const dir = path.dirname(ACCOUNTS_FILE);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-        
-        fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
-        
-        log.info(`Token 已保存到 ${ACCOUNTS_FILE}`);
         
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end('<h1>授权成功！</h1><p>Token 已保存，可以关闭此页面。</p>');

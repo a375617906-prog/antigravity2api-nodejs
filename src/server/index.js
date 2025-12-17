@@ -3,13 +3,13 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { generateAssistantResponse, generateAssistantResponseNoStream, getAvailableModels, generateImageForSD, closeRequester } from '../api/client.js';
-import { generateRequestBody } from '../utils/utils.js';
+import { generateRequestBody, prepareImageRequest } from '../utils/utils.js';
 import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import adminRouter from '../routes/admin.js';
 import sdRouter from '../routes/sd.js';
-import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
+import memoryManager, { MemoryPressure, registerMemoryPoolCleanup } from '../utils/memoryManager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -65,14 +65,8 @@ const releaseChunkObject = (obj) => {
   if (chunkPool.length < maxSize) chunkPool.push(obj);
 };
 
-// 注册内存清理回调
-memoryManager.registerCleanup((pressure) => {
-  const poolSizes = memoryManager.getPoolSizes();
-  // 根据压力缩减对象池
-  while (chunkPool.length > poolSizes.chunk) {
-    chunkPool.pop();
-  }
-});
+// 注册内存清理回调（使用统一工具收缩对象池）
+registerMemoryPoolCleanup(chunkPool, () => memoryManager.getPoolSizes().chunk);
 
 // 启动内存管理器
 memoryManager.start(30000);
@@ -193,17 +187,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const isImageModel = model.includes('-image');
     const requestBody = generateRequestBody(messages, model, params, tools, token);
     if (isImageModel) {
-      requestBody.request.generationConfig={
-        candidateCount: 1,
-        // imageConfig:{
-        //   aspectRatio: "1:1"
-        // }
-      }
-      requestBody.requestType="image_gen";
-      //requestBody.request.systemInstruction.parts[0].text += "现在你作为绘画模型聚焦于帮助用户生成图片";
-      delete requestBody.request.systemInstruction;
-      delete requestBody.request.tools;
-      delete requestBody.request.toolConfig;
+      prepareImageRequest(requestBody);
     }
     //console.log(JSON.stringify(requestBody,null,2))
     
@@ -233,7 +217,12 @@ app.post('/v1/chat/completions', async (req, res) => {
               writeStreamData(res, createStreamChunk(id, created, model, delta));
             } else if (data.type === 'tool_calls') {
               hasToolCall = true;
-              const delta = { tool_calls: data.tool_calls };
+              // OpenAI 流式 schema 要求每个 tool_call 带有 index 字段
+              const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => ({
+                index,
+                ...toolCall
+              }));
+              const delta = { tool_calls: toolCallsWithIndex };
               writeStreamData(res, createStreamChunk(id, created, model, delta));
             } else {
               const delta = { content: data.content };

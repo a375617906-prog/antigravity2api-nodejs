@@ -162,7 +162,7 @@ curl http://localhost:8045/v1/chat/completions \
 | `top_p` | number | ❌ | Top P 参数，默认 1 |
 | `top_k` | number | ❌ | Top K 参数，默认 50 |
 | `max_tokens` | number | ❌ | 最大 token 数，默认 32000 |
-| `thinking_budget` | number | ❌ | 思考预算（仅对思考模型生效），范围 1024-32000，默认 16000 |
+| `thinking_budget` | number | ❌ | 思考预算（仅对思考模型生效），可为 0 或 1024-32000，默认 16000（0 表示关闭思考预算限制） |
 | `reasoning_effort` | string | ❌ | 思维链强度（OpenAI 格式），可选值：`low`(1024)、`medium`(16000)、`high`(32000) |
 | `tools` | array | ❌ | 工具列表（Function Calling） |
 

@@ -357,7 +357,7 @@ curl http://localhost:8045/v1/chat/completions \
     "topP": 1,                 // 默认 top_p
     "topK": 50,                // 默认 top_k
     "maxTokens": 32000,        // 默认最大 token 数
-    "thinkingBudget": 16000    // 默认思考预算（仅对思考模型生效，范围 1024-32000）
+    "thinkingBudget": 1024     // 默认思考预算（仅对思考模型生效，范围 1024-32000）
   },
   "cache": {
     "modelListTTL": 3600000    // 模型列表缓存时间（毫秒），默认 1 小时

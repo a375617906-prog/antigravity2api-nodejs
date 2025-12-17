@@ -1,6 +1,6 @@
 import express from 'express';
 import { getAvailableModels, generateImageForSD } from '../api/client.js';
-import { generateRequestBody } from '../utils/utils.js';
+import { generateRequestBody, prepareImageRequest } from '../utils/utils.js';
 import tokenManager from '../auth/token_manager.js';
 import logger from '../utils/logger.js';
 
@@ -72,12 +72,7 @@ const SD_MOCK_DATA = {
 function buildImageRequestBody(prompt, token) {
   const messages = [{ role: 'user', content: prompt }];
   const requestBody = generateRequestBody(messages, 'gemini-3-pro-image', {}, null, token);
-  requestBody.request.generationConfig = { candidateCount: 1 };
-  requestBody.requestType = 'image_gen';
-  delete requestBody.request.systemInstruction;
-  delete requestBody.request.tools;
-  delete requestBody.request.toolConfig;
-  return requestBody;
+  return prepareImageRequest(requestBody);
 }
 
 // GET 路由
@@ -141,12 +136,9 @@ router.post('/img2img', async (req, res) => {
     }
     
     const messages = [{ role: 'user', content }];
-    const requestBody = generateRequestBody(messages, 'gemini-3-pro-image', {}, null, token);
-    requestBody.request.generationConfig = { candidateCount: 1 };
-    requestBody.requestType = 'image_gen';
-    delete requestBody.request.systemInstruction;
-    delete requestBody.request.tools;
-    delete requestBody.request.toolConfig;
+    const requestBody = prepareImageRequest(
+      generateRequestBody(messages, 'gemini-3-pro-image', {}, null, token)
+    );
     
     const images = await generateImageForSD(requestBody, token);
     

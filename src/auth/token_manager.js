@@ -6,6 +6,7 @@ import { log } from '../utils/logger.js';
 import { generateSessionId, generateProjectId } from '../utils/idGenerator.js';
 import config, { getConfigJson } from '../config/config.js';
 import { OAUTH_CONFIG } from '../constants/oauth.js';
+import { buildAxiosRequestConfig } from '../utils/httpClient.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -109,7 +110,7 @@ class TokenManager {
   }
 
   async fetchProjectId(token) {
-    const response = await axios({
+    const response = await axios(buildAxiosRequestConfig({
       method: 'POST',
       url: 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist',
       headers: {
@@ -119,13 +120,8 @@ class TokenManager {
         'Content-Type': 'application/json',
         'Accept-Encoding': 'gzip'
       },
-      data: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
-      timeout: config.timeout,
-      proxy: config.proxy ? (() => {
-        const proxyUrl = new URL(config.proxy);
-        return { protocol: proxyUrl.protocol.replace(':', ''), host: proxyUrl.hostname, port: parseInt(proxyUrl.port) };
-      })() : false
-    });
+      data: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } })
+    }));
     return response.data?.cloudaicompanionProject;
   }
 
@@ -145,7 +141,7 @@ class TokenManager {
     });
 
     try {
-      const response = await axios({
+      const response = await axios(buildAxiosRequestConfig({
         method: 'POST',
         url: OAUTH_CONFIG.TOKEN_URL,
         headers: {
@@ -154,13 +150,8 @@ class TokenManager {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Accept-Encoding': 'gzip'
         },
-        data: body.toString(),
-        timeout: config.timeout,
-        proxy: config.proxy ? (() => {
-          const proxyUrl = new URL(config.proxy);
-          return { protocol: proxyUrl.protocol.replace(':', ''), host: proxyUrl.hostname, port: parseInt(proxyUrl.port) };
-        })() : false
-      });
+        data: body.toString()
+      }));
 
       token.access_token = response.data.access_token;
       token.expires_in = response.data.expires_in;

@@ -221,17 +221,26 @@ function showOAuthModal() {
     modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
 }
 
-function showManualModal() {
-    const modal = document.createElement('div');
-    modal.className = 'modal form-modal';
-    modal.innerHTML = `
+function createTokenFormBody({
+    title,
+    showAccess = true,
+    showRefresh = true,
+    showExpires = true
+} = {}) {
+    const parts = [];
+    if (showAccess) {
+        parts.push('<input type="text" id="modalAccessToken" placeholder="Access Token (必填)">');
+    }
+    if (showRefresh) {
+        parts.push('<input type="text" id="modalRefreshToken" placeholder="Refresh Token (必填)">');
+    }
+    if (showExpires) {
+        parts.push('<input type="number" id="modalExpiresIn" placeholder="过期时间(秒)" value="3599">');
+    }
+    return `
         <div class="modal-content">
-            <div class="modal-title">✏️ 手动填入Token</div>
-            <div class="form-row">
-                <input type="text" id="modalAccessToken" placeholder="Access Token (必填)">
-                <input type="text" id="modalRefreshToken" placeholder="Refresh Token (必填)">
-                <input type="number" id="modalExpiresIn" placeholder="过期时间(秒)" value="3599">
-            </div>
+            <div class="modal-title">${title}</div>
+            <div class="form-row">${parts.join('')}</div>
             <p style="font-size: 0.8rem; color: var(--text-light); margin-bottom: 12px;">💡 过期时间默认3599秒(约1小时)</p>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">取消</button>
@@ -239,6 +248,12 @@ function showManualModal() {
             </div>
         </div>
     `;
+}
+
+function showManualModal() {
+    const modal = document.createElement('div');
+    modal.className = 'modal form-modal';
+    modal.innerHTML = createTokenFormBody({ title: '✏️ 手动填入Token' });
     document.body.appendChild(modal);
     modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
 }
@@ -554,7 +569,8 @@ function renderQuotaSummary(summaryEl, quotaData) {
         }
     });
     
-    const percentage = (minQuota.remaining * 100).toFixed(0);
+    const percentage = minQuota.remaining * 100;
+    const percentageText = `${percentage.toFixed(2)}%`;
     const shortName = minModel.replace('models/', '').replace('publishers/google/', '').split('/').pop();
     const barColor = percentage > 50 ? '#10b981' : percentage > 20 ? '#f59e0b' : '#ef4444';
     
@@ -563,7 +579,7 @@ function renderQuotaSummary(summaryEl, quotaData) {
         <span class="quota-summary-icon">📊</span>
         <span class="quota-summary-model" title="${minModel}">${shortName}</span>
         <span class="quota-summary-bar"><span style="width:${percentage}%;background:${barColor}"></span></span>
-        <span class="quota-summary-pct">${percentage}%</span>
+        <span class="quota-summary-pct">${percentageText}</span>
     `;
 }
 
@@ -628,7 +644,8 @@ async function loadQuotaDetail(cardId, refreshToken) {
                 if (items.length === 0) return '';
                 let groupHtml = '';
                 items.forEach(({ modelId, quota }) => {
-                    const percentage = (quota.remaining * 100).toFixed(0);
+                    const percentage = quota.remaining * 100;
+                    const percentageText = `${percentage.toFixed(2)}%`;
                     const barColor = percentage > 50 ? '#10b981' : percentage > 20 ? '#f59e0b' : '#ef4444';
                     const shortName = modelId.replace('models/', '').replace('publishers/google/', '').split('/').pop();
                     // 紧凑的一行显示
@@ -637,7 +654,7 @@ async function loadQuotaDetail(cardId, refreshToken) {
                             <span class="quota-detail-icon">${icon}</span>
                             <span class="quota-detail-name">${shortName}</span>
                             <span class="quota-detail-bar"><span style="width:${percentage}%;background:${barColor}"></span></span>
-                            <span class="quota-detail-pct">${percentage}%</span>
+                            <span class="quota-detail-pct">${percentageText}</span>
                         </div>
                     `;
                 });
@@ -1120,7 +1137,8 @@ function renderQuotaModal(quotaContent, quotaData) {
         if (items.length === 0) return '';
         let groupHtml = `<div class="quota-group-title">${title}</div><div class="quota-grid">`;
         items.forEach(({ modelId, quota }) => {
-            const percentage = (quota.remaining * 100).toFixed(0);
+            const percentage = quota.remaining * 100;
+            const percentageText = `${percentage.toFixed(2)}%`;
             const barColor = percentage > 50 ? '#10b981' : percentage > 20 ? '#f59e0b' : '#ef4444';
             const shortName = modelId.replace('models/', '').replace('publishers/google/', '');
             groupHtml += `
@@ -1131,7 +1149,7 @@ function renderQuotaModal(quotaContent, quotaData) {
                     </div>
                     <div class="quota-info-row">
                         <span class="quota-reset">重置: ${quota.resetTime}</span>
-                        <span class="quota-percentage">${percentage}%</span>
+                        <span class="quota-percentage">${percentageText}</span>
                     </div>
                 </div>
             `;
@@ -1275,7 +1293,10 @@ document.getElementById('configForm').addEventListener('submit', async (e) => {
             else if (key === 'DEFAULT_TOP_P') jsonConfig.defaults.topP = parseFloat(value) || undefined;
             else if (key === 'DEFAULT_TOP_K') jsonConfig.defaults.topK = parseInt(value) || undefined;
             else if (key === 'DEFAULT_MAX_TOKENS') jsonConfig.defaults.maxTokens = parseInt(value) || undefined;
-            else if (key === 'DEFAULT_THINKING_BUDGET') jsonConfig.defaults.thinkingBudget = parseInt(value) || undefined;
+            else if (key === 'DEFAULT_THINKING_BUDGET') {
+                const num = parseInt(value);
+                jsonConfig.defaults.thinkingBudget = Number.isNaN(num) ? undefined : num;
+            }
             else if (key === 'TIMEOUT') jsonConfig.other.timeout = parseInt(value) || undefined;
             else if (key === 'SKIP_PROJECT_ID_FETCH') jsonConfig.other.skipProjectIdFetch = value === 'true';
             else if (key === 'ROTATION_STRATEGY') jsonConfig.rotation.strategy = value || undefined;

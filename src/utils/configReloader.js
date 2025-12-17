@@ -1,4 +1,4 @@
-import config, { getConfigJson } from '../config/config.js';
+import config, { getConfigJson, getProxyConfig } from '../config/config.js';
 
 /**
  * 配置字段映射表：config对象路径 -> config.json路径 / 环境变量
@@ -10,7 +10,7 @@ const CONFIG_MAPPING = [
   { target: 'defaults.top_p', source: 'defaults.topP', default: 0.85 },
   { target: 'defaults.top_k', source: 'defaults.topK', default: 50 },
   { target: 'defaults.max_tokens', source: 'defaults.maxTokens', default: 32000 },
-  { target: 'defaults.thinking_budget', source: 'defaults.thinkingBudget', default: 16000 },
+  { target: 'defaults.thinking_budget', source: 'defaults.thinkingBudget', default: 1024 },
   { target: 'timeout', source: 'other.timeout', default: 300000 },
   { target: 'skipProjectIdFetch', source: 'other.skipProjectIdFetch', default: false, transform: v => v === true },
   { target: 'maxImages', source: 'other.maxImages', default: 10 },
@@ -21,25 +21,6 @@ const CONFIG_MAPPING = [
   { target: 'api.host', source: 'api.host', default: 'daily-cloudcode-pa.sandbox.googleapis.com' },
   { target: 'api.userAgent', source: 'api.userAgent', default: 'antigravity/1.11.3 windows/amd64' }
 ];
-
-/**
- * 获取代理配置：优先使用 PROXY，其次使用系统代理环境变量
- */
-function getProxyConfig() {
-  // 优先使用显式配置的 PROXY
-  if (process.env.PROXY) {
-    return process.env.PROXY;
-  }
-  
-  // 检查系统代理环境变量（按优先级）
-  return process.env.HTTPS_PROXY ||
-         process.env.https_proxy ||
-         process.env.HTTP_PROXY ||
-         process.env.http_proxy ||
-         process.env.ALL_PROXY ||
-         process.env.all_proxy ||
-         null;
-}
 
 const ENV_MAPPING = [
   { target: 'security.apiKey', env: 'API_KEY', default: null },
