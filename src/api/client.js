@@ -3,10 +3,12 @@ import config from '../config/config.js';
 import AntigravityRequester from '../AntigravityRequester.js';
 import { saveBase64Image } from '../utils/imageStorage.js';
 import logger from '../utils/logger.js';
-import memoryManager, { MemoryPressure } from '../utils/memoryManager.js';
+import memoryManager from '../utils/memoryManager.js';
 import { httpRequest, httpStreamRequest } from '../utils/httpClient.js';
 import { MODEL_LIST_CACHE_TTL } from '../constants/index.js';
 import { createApiError } from '../utils/errors.js';
+import fs from 'fs/promises';
+import path from 'path';
 import {
   getLineBuffer,
   releaseLineBuffer,
@@ -20,15 +22,60 @@ import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatu
 let requester = null;
 let useAxios = false;
 
+// ==================== 调试：最终请求/原始响应完整输出 ====================
+const DEBUG_DUMP_DIR = path.join(process.cwd(), 'data', 'debug-dumps');
+
+function isDebugDumpEnabled() {
+  return config.debugDumpRequestResponse === true;
+}
+
+function createDumpId(prefix = 'dump') {
+  const rand = Math.random().toString(16).slice(2, 10);
+  const now = new Date();
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const pad3 = (n) => String(n).padStart(3, '0');
+  // Windows 文件名不允许 ':'，所以用 '-' 分隔时间
+  const tsReadable =
+    `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}` +
+    `-${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}` +
+    `-${pad3(now.getMilliseconds())}`;
+  return `${prefix}-${tsReadable}-${rand}`;
+}
+
+async function writeDumpFile(filename, content) {
+  await fs.mkdir(DEBUG_DUMP_DIR, { recursive: true });
+  const fullPath = path.join(DEBUG_DUMP_DIR, filename);
+  await fs.writeFile(fullPath, content ?? '', 'utf8');
+  return fullPath;
+}
+
+async function dumpFinalRequest(dumpId, requestBody) {
+  if (!isDebugDumpEnabled()) return;
+  try {
+    const json = JSON.stringify(requestBody, null, 2);
+    const filePath = await writeDumpFile(`${dumpId}.request.json`, json);
+    logger.warn(`[DEBUG_DUMP ${dumpId}] 已写入最终请求体: ${filePath}`);
+    console.log(`\n[DEBUG_DUMP ${dumpId}] FINAL REQUEST BODY\n${json}\n[DEBUG_DUMP ${dumpId}] END FINAL REQUEST BODY\n`);
+  } catch (e) {
+    logger.error(`[DEBUG_DUMP ${dumpId}] 写入最终请求体失败:`, e?.message || e);
+  }
+}
+
+async function dumpFinalRawResponse(dumpId, rawText, ext = 'txt') {
+  if (!isDebugDumpEnabled()) return;
+  try {
+    const text = rawText ?? '';
+    const filePath = await writeDumpFile(`${dumpId}.response.${ext}`, text);
+    logger.warn(`[DEBUG_DUMP ${dumpId}] 已写入原始响应: ${filePath}`);
+    console.log(`\n[DEBUG_DUMP ${dumpId}] FINAL RAW RESPONSE\n${text}\n[DEBUG_DUMP ${dumpId}] END FINAL RAW RESPONSE\n`);
+  } catch (e) {
+    logger.error(`[DEBUG_DUMP ${dumpId}] 写入原始响应失败:`, e?.message || e);
+  }
+}
+
 // ==================== 模型列表缓存（智能管理） ====================
-// 缓存过期时间根据内存压力动态调整
 const getModelCacheTTL = () => {
-  const baseTTL = config.cache?.modelListTTL || MODEL_LIST_CACHE_TTL;
-  const pressure = memoryManager.currentPressure;
-  // 高压力时缩短缓存时间
-  if (pressure === MemoryPressure.CRITICAL) return Math.min(baseTTL, 5 * 60 * 1000);
-  if (pressure === MemoryPressure.HIGH) return Math.min(baseTTL, 15 * 60 * 1000);
-  return baseTTL;
+  return config.cache?.modelListTTL || MODEL_LIST_CACHE_TTL;
 };
 
 let modelListCache = null;
@@ -85,22 +132,13 @@ function registerMemoryCleanup() {
   // 由流式解析模块管理自身对象池大小
   registerStreamMemoryCleanup();
 
-  memoryManager.registerCleanup((pressure) => {
-    // 高压力或紧急时清理模型缓存
-    if (pressure === MemoryPressure.HIGH || pressure === MemoryPressure.CRITICAL) {
-      const ttl = getModelCacheTTL();
-      const now = Date.now();
-      if (modelListCache && (now - modelListCacheTime) > ttl) {
-        modelListCache = null;
-        modelListCacheTime = 0;
-        logger.info('已清理过期模型列表缓存');
-      }
-    }
-    
-    if (pressure === MemoryPressure.CRITICAL && modelListCache) {
+  // 统一由内存清理器定时触发：仅清理“已过期”的模型列表缓存
+  memoryManager.registerCleanup(() => {
+    const ttl = getModelCacheTTL();
+    const now = Date.now();
+    if (modelListCache && (now - modelListCacheTime) > ttl) {
       modelListCache = null;
       modelListCacheTime = 0;
-      logger.info('紧急清理模型列表缓存');
     }
   });
 }
@@ -133,7 +171,7 @@ function buildRequesterConfig(headers, body = null) {
 
 
 // 统一错误处理
-async function handleApiError(error, token) {
+async function handleApiError(error, token, dumpId = null) {
   const status = error.response?.status || error.status || error.statusCode || 500;
   let errorBody = error.message;
   
@@ -147,6 +185,10 @@ async function handleApiError(error, token) {
     errorBody = JSON.stringify(error.response.data, null, 2);
   } else if (error.response?.data) {
     errorBody = error.response.data;
+  }
+
+  if (dumpId) {
+    await dumpFinalRawResponse(dumpId, String(errorBody ?? ''), 'error.txt');
   }
   
   if (status === 403) {
@@ -166,6 +208,10 @@ async function handleApiError(error, token) {
 export async function generateAssistantResponse(requestBody, token, callback) {
   
   const headers = buildHeaders(token);
+  const dumpId = isDebugDumpEnabled() ? createDumpId('stream') : null;
+  if (dumpId) await dumpFinalRequest(dumpId, requestBody);
+  const rawChunks = dumpId ? [] : null;
+
   // 在 state 中临时缓存思维链签名，供流式多片段复用，并携带 session 与 model 信息以写入全局缓存
   const state = {
     toolCalls: [],
@@ -176,6 +222,7 @@ export async function generateAssistantResponse(requestBody, token, callback) {
   const lineBuffer = getLineBuffer(); // 从对象池获取
   
   const processChunk = (chunk) => {
+    if (rawChunks) rawChunks.push(chunk);
     const lines = lineBuffer.append(chunk);
     for (let i = 0; i < lines.length; i++) {
       parseAndEmitStreamChunk(lines[i], state, callback);
@@ -214,6 +261,7 @@ export async function generateAssistantResponse(requestBody, token, callback) {
           .onData((chunk) => {
             if (statusCode !== 200) {
               errorBody += chunk;
+              if (rawChunks) rawChunks.push(chunk);
             } else {
               processChunk(chunk);
             }
@@ -229,9 +277,13 @@ export async function generateAssistantResponse(requestBody, token, callback) {
           .onError(reject);
       });
     }
+
+    if (dumpId && rawChunks) {
+      await dumpFinalRawResponse(dumpId, rawChunks.join(''), 'sse.txt');
+    }
   } catch (error) {
     releaseLineBuffer(lineBuffer); // 确保归还
-    await handleApiError(error, token);
+    await handleApiError(error, token, dumpId);
   }
 }
 
@@ -343,26 +395,44 @@ export async function getModelsWithQuotas(token) {
 export async function generateAssistantResponseNoStream(requestBody, token) {
   
   const headers = buildHeaders(token);
+  const dumpId = isDebugDumpEnabled() ? createDumpId('no_stream') : null;
+  if (dumpId) await dumpFinalRequest(dumpId, requestBody);
   let data;
   
   try {
     if (useAxios) {
-      data = (await httpRequest({
-        method: 'POST',
-        url: config.api.noStreamUrl,
-        headers,
-        data: requestBody
-      })).data;
+      if (dumpId) {
+        const resp = await httpRequest({
+          method: 'POST',
+          url: config.api.noStreamUrl,
+          headers,
+          data: requestBody,
+          responseType: 'text'
+        });
+        const rawText = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data, null, 2);
+        await dumpFinalRawResponse(dumpId, rawText, 'json');
+        data = JSON.parse(rawText);
+      } else {
+        data = (await httpRequest({
+          method: 'POST',
+          url: config.api.noStreamUrl,
+          headers,
+          data: requestBody
+        })).data;
+      }
     } else {
       const response = await requester.antigravity_fetch(config.api.noStreamUrl, buildRequesterConfig(headers, requestBody));
       if (response.status !== 200) {
         const errorBody = await response.text();
+        if (dumpId) await dumpFinalRawResponse(dumpId, errorBody, 'txt');
         throw { status: response.status, message: errorBody };
       }
-      data = await response.json();
+      const rawText = await response.text();
+      if (dumpId) await dumpFinalRawResponse(dumpId, rawText, 'json');
+      data = JSON.parse(rawText);
     }
   } catch (error) {
-    await handleApiError(error, token);
+    await handleApiError(error, token, dumpId);
   }
   //console.log(JSON.stringify(data));
   // 解析响应内容
@@ -370,29 +440,38 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   let content = '';
   let reasoningContent = '';
   let reasoningSignature = null;
+  let lastSeenSignature = null;
   const toolCalls = [];
   const imageUrls = [];
   
   for (const part of parts) {
+    if (part.thoughtSignature) {
+      lastSeenSignature = part.thoughtSignature;
+    }
     if (part.thought === true) {
       // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
       reasoningContent += part.text || '';
-      if (part.thoughtSignature && !reasoningSignature) {
+      if (part.thoughtSignature) {
+        // 以“最新出现”的签名为准（有些响应会在末尾才给签名）
         reasoningSignature = part.thoughtSignature;
       }
     } else if (part.text !== undefined) {
       content += part.text;
     } else if (part.functionCall) {
       const toolCall = convertToToolCall(part.functionCall, requestBody.request?.sessionId, requestBody.model);
-      if (part.thoughtSignature) {
-        toolCall.thoughtSignature = part.thoughtSignature;
-      }
+      const sig = part.thoughtSignature || lastSeenSignature || null;
+      if (sig) toolCall.thoughtSignature = sig;
       toolCalls.push(toolCall);
     } else if (part.inlineData) {
       // 保存图片到本地并获取 URL
       const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
       imageUrls.push(imageUrl);
     }
+  }
+
+  // 若本轮未在 thought part 上拿到签名，则回退使用“最后出现”的签名（Gemini 等可能只在 functionCall part 上给签名）
+  if (!reasoningSignature && lastSeenSignature) {
+    reasoningSignature = lastSeenSignature;
   }
   
   // 提取 token 使用统计
@@ -403,15 +482,26 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
     total_tokens: usage.totalTokenCount || 0
   } : null;
   
-  // 将新的签名写入全局缓存（按 sessionId + model），供后续请求兜底使用
+  // 将新的签名写入全局缓存（按 model），供后续请求兜底使用
   const sessionId = requestBody.request?.sessionId;
   const model = requestBody.model;
-  if (sessionId && model) {
+  if (config.useCachedSignature && sessionId && model) {
     if (reasoningSignature) {
       setReasoningSignature(sessionId, model, reasoningSignature);
     }
-    // 工具签名：取第一个带 thoughtSignature 的工具作为缓存源
-    const toolSig = toolCalls.find(tc => tc.thoughtSignature)?.thoughtSignature;
+    // 工具签名：取最后一个带 thoughtSignature 的工具作为缓存源（更接近“最新”）
+    let toolSig = null;
+    for (let i = toolCalls.length - 1; i >= 0; i--) {
+      const sig = toolCalls[i]?.thoughtSignature;
+      if (sig) {
+        toolSig = sig;
+        break;
+      }
+    }
+    // 若上游不在 functionCall 上附带签名，则默认沿用同一轮生成中的思维签名
+    if (!toolSig && reasoningSignature && toolCalls.length > 0) {
+      toolSig = reasoningSignature;
+    }
     if (toolSig) {
       setToolSignature(sessionId, model, toolSig);
     }

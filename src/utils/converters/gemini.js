@@ -51,8 +51,29 @@ function processFunctionCallIds(contents) {
 /**
  * 处理 model 消息中的 thought 和签名
  */
-function processModelThoughts(content, reasoningSignature, toolSignature) {
+function processModelThoughts(content, reasoningSignature, toolSignature, enableThinking) {
   const parts = content.parts;
+  const fallbackSig = reasoningSignature || toolSignature;
+
+  // 非思考模型：仅为 inlineData 自动补签名（避免历史消息回放时报缺签名）
+  if (!enableThinking) {
+    if (!fallbackSig) return;
+    for (const part of parts) {
+      if (part.inlineData && !part.thoughtSignature) {
+        part.thoughtSignature = fallbackSig;
+      }
+    }
+    return;
+  }
+
+  const isStandaloneSignaturePart = (part) =>
+    part &&
+    part.thoughtSignature &&
+    !part.thought &&
+    !part.functionCall &&
+    !part.functionResponse &&
+    !part.text &&
+    !part.inlineData;
   
   // 查找 thought 和独立 thoughtSignature 的位置
   let thoughtIndex = -1;
@@ -64,7 +85,7 @@ function processModelThoughts(content, reasoningSignature, toolSignature) {
     if (part.thought === true && !part.thoughtSignature) {
       thoughtIndex = i;
     }
-    if (part.thoughtSignature && !part.thought) {
+    if (isStandaloneSignaturePart(part)) {
       signatureIndex = i;
       signatureValue = part.thoughtSignature;
     }
@@ -75,31 +96,34 @@ function processModelThoughts(content, reasoningSignature, toolSignature) {
     parts[thoughtIndex].thoughtSignature = signatureValue;
     parts.splice(signatureIndex, 1);
   } else if (thoughtIndex !== -1 && signatureIndex === -1) {
-    parts[thoughtIndex].thoughtSignature = reasoningSignature;
+    if (fallbackSig) parts[thoughtIndex].thoughtSignature = fallbackSig;
   } else if (thoughtIndex === -1) {
-    parts.unshift(createThoughtPart(' ', reasoningSignature));
+    parts.unshift(createThoughtPart(' ', fallbackSig));
   }
   
   // 收集独立的签名 parts（用于 functionCall）
   const standaloneSignatures = [];
   for (let i = parts.length - 1; i >= 0; i--) {
     const part = parts[i];
-    if (part.thoughtSignature && !part.thought && !part.functionCall && !part.text) {
+    if (isStandaloneSignaturePart(part)) {
       standaloneSignatures.unshift({ index: i, signature: part.thoughtSignature });
     }
   }
   
-  // 为 functionCall 分配签名
+  // 为 functionCall / inlineData 分配签名
   let sigIndex = 0;
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    if (part.functionCall && !part.thoughtSignature) {
+    if ((!part.thoughtSignature) && (part.functionCall || part.inlineData)) {
       if (sigIndex < standaloneSignatures.length) {
         part.thoughtSignature = standaloneSignatures[sigIndex].signature;
         sigIndex++;
-      } else {
-        part.thoughtSignature = toolSignature;
+        continue;
       }
+
+      // functionCall 更倾向 toolSignature；inlineData 更倾向 reasoningSignature
+      const partFallback = part.functionCall ? (toolSignature || reasoningSignature) : (reasoningSignature || toolSignature);
+      if (partFallback) part.thoughtSignature = partFallback;
     }
   }
   
@@ -119,15 +143,13 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
   if (request.contents && Array.isArray(request.contents)) {
     processFunctionCallIds(request.contents);
 
-    if (enableThinking) {
-      const { reasoningSignature, toolSignature } = getSignatureContext(token.sessionId, actualModelName);
-      
-      request.contents.forEach(content => {
-        if (content.role === 'model' && content.parts && Array.isArray(content.parts)) {
-          processModelThoughts(content, reasoningSignature, toolSignature);
-        }
-      });
-    }
+    const { reasoningSignature, toolSignature } = getSignatureContext(token.sessionId, actualModelName);
+
+    request.contents.forEach(content => {
+      if (content.role === 'model' && content.parts && Array.isArray(content.parts)) {
+        processModelThoughts(content, reasoningSignature, toolSignature, enableThinking);
+      }
+    });
   }
 
   // 使用统一参数规范化模块处理 Gemini 格式参数

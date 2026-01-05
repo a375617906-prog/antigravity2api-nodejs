@@ -87,24 +87,13 @@ function renderTokens(tokens) {
         return;
     }
     
-    // 收集需要自动刷新的过期 Token
-    const expiredTokensToRefresh = [];
-    
     tokenList.innerHTML = filteredTokens.map((token, index) => {
-        const expireTime = new Date(token.timestamp + token.expires_in * 1000);
-        const isExpired = expireTime < new Date();
         const isRefreshing = refreshingTokens.has(token.refresh_token);
-        const expireStr = expireTime.toLocaleString('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'});
         const cardId = token.refresh_token.substring(0, 8);
         
         // 计算在原始列表中的序号（基于添加顺序）
         const originalIndex = cachedTokens.findIndex(t => t.refresh_token === token.refresh_token);
         const tokenNumber = originalIndex + 1;
-        
-        // 如果已过期且启用状态，加入待刷新列表
-        if (isExpired && token.enable && !isRefreshing) {
-            expiredTokensToRefresh.push(token.refresh_token);
-        }
         
         // 转义所有用户数据防止 XSS
         const safeRefreshToken = escapeJs(token.refresh_token);
@@ -115,11 +104,14 @@ function renderTokens(tokens) {
         const safeEmailJs = escapeJs(token.email || '');
         
         return `
-        <div class="token-card ${!token.enable ? 'disabled' : ''} ${isExpired ? 'expired' : ''} ${isRefreshing ? 'refreshing' : ''} ${skipAnimation ? 'no-animation' : ''}" id="card-${escapeHtml(cardId)}">
+        <div class="token-card ${!token.enable ? 'disabled' : ''} ${isRefreshing ? 'refreshing' : ''} ${skipAnimation ? 'no-animation' : ''}" id="card-${escapeHtml(cardId)}">
             <div class="token-header">
-                <span class="status ${token.enable ? 'enabled' : 'disabled'}">
-                    ${token.enable ? '✅ 启用' : '❌ 禁用'}
-                </span>
+                <div class="token-header-left">
+                    <span class="status ${token.enable ? 'enabled' : 'disabled'}">
+                        ${token.enable ? '✅ 启用' : '❌ 禁用'}
+                    </span>
+                    <button class="btn-icon token-refresh-btn ${isRefreshing ? 'loading' : ''}" id="refresh-btn-${escapeHtml(cardId)}" onclick="manualRefreshToken('${safeRefreshToken}')" title="刷新Token" ${isRefreshing ? 'disabled' : ''}>🔄</button>
+                </div>
                 <div class="token-header-right">
                     <button class="btn-icon" onclick="showTokenDetail('${safeRefreshToken}')" title="编辑全部">✏️</button>
                     <span class="token-id">#${tokenNumber}</span>
@@ -139,11 +131,6 @@ function renderTokens(tokens) {
                     <span class="info-label">📧</span>
                     <span class="info-value sensitive-info">${safeEmail || '点击设置'}</span>
                     <span class="info-edit-icon">✏️</span>
-                </div>
-                <div class="info-row ${isExpired ? 'expired-text' : ''}" id="expire-row-${escapeHtml(cardId)}">
-                    <span class="info-label">⏰</span>
-                    <span class="info-value">${isRefreshing ? '🔄 刷新中...' : escapeHtml(expireStr)}${isExpired && !isRefreshing ? ' (已过期)' : ''}</span>
-                    <button class="btn-icon btn-refresh" onclick="manualRefreshToken('${safeRefreshToken}')" title="刷新Token" ${isRefreshing ? 'disabled' : ''}>🔄</button>
                 </div>
             </div>
             <div class="token-quota-inline" id="quota-inline-${escapeHtml(cardId)}">
@@ -171,13 +158,6 @@ function renderTokens(tokens) {
     
     // 重置动画跳过标志
     skipAnimation = false;
-    
-    // 自动刷新过期的 Token
-    if (expiredTokensToRefresh.length > 0) {
-        expiredTokensToRefresh.forEach(refreshToken => {
-            autoRefreshToken(refreshToken);
-        });
-    }
 }
 
 // 手动刷新 Token
@@ -189,7 +169,7 @@ async function manualRefreshToken(refreshToken) {
     await autoRefreshToken(refreshToken);
 }
 
-// 自动刷新过期 Token
+// 刷新指定 Token（手动触发）
 async function autoRefreshToken(refreshToken) {
     if (refreshingTokens.has(refreshToken)) return;
     
@@ -198,11 +178,15 @@ async function autoRefreshToken(refreshToken) {
     
     // 更新 UI 显示刷新中状态
     const card = document.getElementById(`card-${cardId}`);
-    const expireRow = document.getElementById(`expire-row-${cardId}`);
-    if (card) card.classList.add('refreshing');
-    if (expireRow) {
-        const valueSpan = expireRow.querySelector('.info-value');
-        if (valueSpan) valueSpan.textContent = '🔄 刷新中...';
+    const refreshBtn = document.getElementById(`refresh-btn-${cardId}`);
+    if (card) {
+        card.classList.remove('refresh-failed');
+        card.classList.add('refreshing');
+    }
+    if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.classList.add('loading');
+        refreshBtn.textContent = '🔄';
     }
     
     try {
@@ -216,14 +200,25 @@ async function autoRefreshToken(refreshToken) {
             showToast('Token 已自动刷新', 'success');
             // 刷新成功后重新加载列表
             refreshingTokens.delete(refreshToken);
+            if (card) card.classList.remove('refreshing');
+            if (refreshBtn) {
+                refreshBtn.disabled = false;
+                refreshBtn.classList.remove('loading');
+                refreshBtn.textContent = '🔄';
+            }
             loadTokens();
         } else {
             showToast(`Token 刷新失败: ${data.message || '未知错误'}`, 'error');
             refreshingTokens.delete(refreshToken);
             // 更新 UI 显示刷新失败
-            if (expireRow) {
-                const valueSpan = expireRow.querySelector('.info-value');
-                if (valueSpan) valueSpan.textContent = '❌ 刷新失败';
+            if (card) {
+                card.classList.remove('refreshing');
+                card.classList.add('refresh-failed');
+            }
+            if (refreshBtn) {
+                refreshBtn.disabled = false;
+                refreshBtn.classList.remove('loading');
+                refreshBtn.textContent = '🔄';
             }
         }
     } catch (error) {
@@ -232,9 +227,14 @@ async function autoRefreshToken(refreshToken) {
         }
         refreshingTokens.delete(refreshToken);
         // 更新 UI 显示刷新失败
-        if (expireRow) {
-            const valueSpan = expireRow.querySelector('.info-value');
-            if (valueSpan) valueSpan.textContent = '❌ 刷新失败';
+        if (card) {
+            card.classList.remove('refreshing');
+            card.classList.add('refresh-failed');
+        }
+        if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.classList.remove('loading');
+            refreshBtn.textContent = '🔄';
         }
     }
 }
@@ -248,9 +248,9 @@ function showManualModal() {
             <div class="form-row">
                 <input type="text" id="modalAccessToken" placeholder="Access Token (必填)">
                 <input type="text" id="modalRefreshToken" placeholder="Refresh Token (必填)">
-                <input type="number" id="modalExpiresIn" placeholder="过期时间(秒)" value="3599">
+                <input type="number" id="modalExpiresIn" placeholder="有效期(秒)" value="3599">
             </div>
-            <p style="font-size: 0.8rem; color: var(--text-light); margin-bottom: 12px;">💡 过期时间默认3599秒(约1小时)</p>
+            <p style="font-size: 0.8rem; color: var(--text-light); margin-bottom: 12px;">💡 有效期默认3599秒(约1小时)</p>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">取消</button>
                 <button class="btn btn-success" onclick="addTokenFromModal()">✅ 添加</button>
@@ -386,7 +386,7 @@ function showTokenDetail(refreshToken) {
     const safeRefreshTokenJs = escapeJs(refreshToken);
     const safeProjectId = escapeHtml(token.projectId || '');
     const safeEmail = escapeHtml(token.email || '');
-    const expireTimeStr = escapeHtml(new Date(token.timestamp + token.expires_in * 1000).toLocaleString('zh-CN'));
+    const updatedAtStr = escapeHtml(token.timestamp ? new Date(token.timestamp).toLocaleString('zh-CN') : '未知');
     
     const modal = document.createElement('div');
     modal.className = 'modal form-modal';
@@ -410,8 +410,8 @@ function showTokenDetail(refreshToken) {
                 <input type="email" id="editEmail" value="${safeEmail}" placeholder="账号邮箱">
             </div>
             <div class="form-group compact">
-                <label>⏰ 过期时间</label>
-                <input type="text" value="${expireTimeStr}" readonly style="background: var(--bg); cursor: not-allowed;">
+                <label>🕒 最后更新时间</label>
+                <input type="text" value="${updatedAtStr}" readonly style="background: var(--bg); cursor: not-allowed;">
             </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">取消</button>

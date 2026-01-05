@@ -52,7 +52,9 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
   const toolCalls = hasToolCalls
     ? message.tool_calls.map(toolCall => {
       const safeName = processToolName(toolCall.function.name, sessionId, actualModelName);
-      const signature = enableThinking ? (toolCall.thoughtSignature || toolSignature) : null;
+      const signature = enableThinking
+        ? (toolCall.thoughtSignature || toolSignature || message.thoughtSignature || reasoningSignature)
+        : null;
       return createFunctionCallPart(toolCall.id, safeName, toolCall.function.arguments, signature);
     })
     : [];
@@ -61,9 +63,13 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
   if (enableThinking) {
     const reasoningText = (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0)
       ? message.reasoning_content : ' ';
-    parts.push(createThoughtPart(reasoningText));
+    const signature = message.thoughtSignature || reasoningSignature || toolSignature;
+    parts.push(createThoughtPart(reasoningText, signature));
   }
-  if (hasContent) parts.push({ text: message.content.trimEnd(), thoughtSignature: message.thoughtSignature || reasoningSignature });
+  if (hasContent) {
+    const part = { text: message.content.trimEnd() };
+    parts.push(part);
+  }
   if (!enableThinking && parts[0]) delete parts[0].thoughtSignature;
 
   pushModelMessage({ parts, toolCalls, hasContent }, antigravityMessages);

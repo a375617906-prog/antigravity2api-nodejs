@@ -13,7 +13,8 @@ import {
   DEFAULT_MAX_REQUEST_SIZE,
   DEFAULT_MAX_IMAGES,
   MODEL_LIST_CACHE_TTL,
-  DEFAULT_GENERATION_PARAMS
+  DEFAULT_GENERATION_PARAMS,
+  MEMORY_CLEANUP_INTERVAL
 } from '../constants/index.js';
 
 // 生成随机凭据的缓存
@@ -126,7 +127,8 @@ export function buildConfig(jsonConfig) {
       port: jsonConfig.server?.port || DEFAULT_SERVER_PORT,
       host: jsonConfig.server?.host || DEFAULT_SERVER_HOST,
       heartbeatInterval: jsonConfig.server?.heartbeatInterval || DEFAULT_HEARTBEAT_INTERVAL,
-      memoryThreshold: jsonConfig.server?.memoryThreshold || 100
+      // 内存定时清理频率：避免频繁扫描/GC 带来的性能损耗
+      memoryCleanupInterval: jsonConfig.server?.memoryCleanupInterval ?? MEMORY_CLEANUP_INTERVAL
     },
     cache: {
       modelListTTL: jsonConfig.cache?.modelListTTL || MODEL_LIST_CACHE_TTL
@@ -163,7 +165,13 @@ export function buildConfig(jsonConfig) {
     systemInstruction: process.env.SYSTEM_INSTRUCTION || '',
     skipProjectIdFetch: jsonConfig.other?.skipProjectIdFetch === true,
     useContextSystemPrompt: jsonConfig.other?.useContextSystemPrompt === true,
-    passSignatureToClient: jsonConfig.other?.passSignatureToClient === true
+    passSignatureToClient: jsonConfig.other?.passSignatureToClient === true,
+    useFallbackSignature: jsonConfig.other?.useFallbackSignature !== false,
+    useCachedSignature: jsonConfig.other?.useCachedSignature !== false,
+    // 调试：完整打印最终请求体与原始响应（可能包含敏感内容/大体积数据）
+    debugDumpRequestResponse:
+      jsonConfig.other?.debugDumpRequestResponse === true ||
+      process.env.DEBUG_DUMP_REQUEST_RESPONSE === '1'
   };
 }
 

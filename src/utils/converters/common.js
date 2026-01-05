@@ -12,12 +12,12 @@ import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName
  * @returns {Object} 包含思维签名和工具签名的对象
  */
 export function getSignatureContext(sessionId, actualModelName) {
-  const cachedReasoningSig = getReasoningSignature(sessionId, actualModelName);
-  const cachedToolSig = getToolSignature(sessionId, actualModelName);
+  const cachedReasoningSig = config.useCachedSignature ? getReasoningSignature(sessionId, actualModelName) : null;
+  const cachedToolSig = config.useCachedSignature ? getToolSignature(sessionId, actualModelName) : null;
 
   return {
-    reasoningSignature: cachedReasoningSig || getThoughtSignatureForModel(actualModelName),
-    toolSignature: cachedToolSig || getToolSignatureForModel(actualModelName)
+    reasoningSignature: cachedReasoningSig || (config.useFallbackSignature ? getThoughtSignatureForModel(actualModelName) : null),
+    toolSignature: cachedToolSig || (config.useFallbackSignature ? getToolSignatureForModel(actualModelName) : null)
   };
 }
 
@@ -29,7 +29,7 @@ export function getSignatureContext(sessionId, actualModelName) {
 export function pushUserMessage(extracted, antigravityMessages) {
   antigravityMessages.push({
     role: 'user',
-    parts: [{ text: extracted.text }, ...extracted.images]
+    parts: [{ text: extracted?.text || ' ' }, ...extracted.images]
   });
 }
 
@@ -83,8 +83,10 @@ export function pushFunctionResponse(toolCallId, functionName, resultContent, an
  * @param {string} signature - 签名
  * @returns {Object} 思维 part
  */
-export function createThoughtPart(text) {
-  return { text: text || ' ', thought: true }
+export function createThoughtPart(text, signature = null) {
+  const part = { text: text || ' ', thought: true };
+  if (signature) part.thoughtSignature = signature;
+  return part;
 }
 
 /**
@@ -118,8 +120,8 @@ export function createFunctionCallPart(id, name, args, signature = null) {
  */
 export function processToolName(originalName, sessionId, actualModelName) {
   const safeName = sanitizeToolName(originalName);
-  if (sessionId && actualModelName && safeName !== originalName) {
-    setToolNameMapping(sessionId, actualModelName, safeName, originalName);
+  if (actualModelName && safeName !== originalName) {
+    setToolNameMapping(actualModelName, safeName, originalName);
   }
   return safeName;
 }

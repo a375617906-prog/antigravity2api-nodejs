@@ -49,6 +49,7 @@ function handleClaudeAssistantMessage(message, antigravityMessages, enableThinki
 
   let textContent = '';
   const toolCalls = [];
+  let messageSignature = null;
 
   if (typeof content === 'string') {
     textContent = content;
@@ -56,9 +57,12 @@ function handleClaudeAssistantMessage(message, antigravityMessages, enableThinki
     for (const item of content) {
       if (item.type === 'text') {
         textContent += item.text || '';
+      } else if (item.type === 'thinking') {
+        // Claude thinking block: signature may be required by upstream when includeThoughts enabled
+        if (!messageSignature && item.signature) messageSignature = item.signature;
       } else if (item.type === 'tool_use') {
         const safeName = processToolName(item.name, sessionId, actualModelName);
-        const signature = enableThinking ? toolSignature : null;
+        const signature = enableThinking ? (item.signature || toolSignature || reasoningSignature) : null;
         toolCalls.push(createFunctionCallPart(item.id, safeName, JSON.stringify(item.input || {}), signature));
       }
     }
@@ -68,9 +72,12 @@ function handleClaudeAssistantMessage(message, antigravityMessages, enableThinki
   const parts = [];
   
   if (enableThinking) {
-    parts.push(createThoughtPart(' '));
+    parts.push(createThoughtPart(' ', messageSignature || reasoningSignature || toolSignature));
   }
-  if (hasContent) parts.push({ text: textContent.trimEnd(), thoughtSignature: reasoningSignature });
+  if (hasContent) {
+    const part = { text: textContent.trimEnd() };
+    parts.push(part);
+  }
   if (!enableThinking && parts[0]) delete parts[0].thoughtSignature;
 
   pushModelMessage({ parts, toolCalls, hasContent }, antigravityMessages);

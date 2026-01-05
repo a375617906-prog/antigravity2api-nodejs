@@ -2,6 +2,7 @@ import memoryManager, { registerMemoryPoolCleanup } from '../utils/memoryManager
 import { generateToolCallId } from '../utils/idGenerator.js';
 import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
 import { getOriginalToolName } from '../utils/toolNameCache.js';
+import config from '../config/config.js';
 
 // 预编译的常量（避免重复创建字符串）
 const DATA_PREFIX = 'data: ';
@@ -76,8 +77,8 @@ function convertToToolCall(functionCall, sessionId, model) {
   const toolCall = getToolCallObject();
   toolCall.id = functionCall.id || generateToolCallId();
   let name = functionCall.name;
-  if (sessionId && model) {
-    const original = getOriginalToolName(sessionId, model, functionCall.name);
+  if (model) {
+    const original = getOriginalToolName(model, functionCall.name);
     if (original) name = original;
   }
   toolCall.function.name = name;
@@ -97,12 +98,25 @@ function parseAndEmitStreamChunk(line, state, callback) {
     
     if (parts) {
       for (const part of parts) {
+        if (part.thoughtSignature) {
+          // Gemini 等模型可能只在 functionCall part 上给出 thoughtSignature；
+          // 将其视为本轮“最新签名”，用于后续 functionCall 兜底与下次请求缓存。
+          if (part.thoughtSignature !== state.reasoningSignature) {
+            state.reasoningSignature = part.thoughtSignature;
+            if (state.sessionId && state.model && config.useCachedSignature) {
+              setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
+            }
+          }
+        }
+
         if (part.thought === true) {
           if (part.thoughtSignature) {
             state.reasoningSignature = part.thoughtSignature;
             if (state.sessionId && state.model) {
               //console.log("服务器传入的签名："+state.reasoningSignature);
-              setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
+              if (config.useCachedSignature) {
+                setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
+              }
             }
           }
           callback({
@@ -114,10 +128,13 @@ function parseAndEmitStreamChunk(line, state, callback) {
           callback({ type: 'text', content: part.text });
         } else if (part.functionCall) {
           const toolCall = convertToToolCall(part.functionCall, state.sessionId, state.model);
-          if (part.thoughtSignature) {
-            toolCall.thoughtSignature = part.thoughtSignature;
+          const sig = part.thoughtSignature || state.reasoningSignature || null;
+          if (sig) {
+            toolCall.thoughtSignature = sig;
             if (state.sessionId && state.model) {
-              setToolSignature(state.sessionId, state.model, part.thoughtSignature);
+              if (config.useCachedSignature) {
+                setToolSignature(state.sessionId, state.model, sig);
+              }
             }
           }
           state.toolCalls.push(toolCall);
